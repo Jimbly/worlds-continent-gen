@@ -2,7 +2,7 @@ Continent Data Generator for Worlds FRVR
 ========================================
 
 **Links**
-* Make Maps: [worlds-continent-gen](http://jimbly.github.io/worlds-continent-gen/index.html)
+* Make Maps: [worlds-continent-gen](http://jimbly.github.io/worlds-continent-gen/)
 * Explore in [Worlds FRVR](https://worlds.frvr.com/)
 
 To view the map you made, open Worlds FRVR, accept the mod permissions dialog, log in and create a new worlds, and chose
