@@ -9,7 +9,9 @@ To view the map you made, open Worlds FRVR, accept the mod permissions dialog, l
 the "Procedural" world type.  If you click Export in the map maker, you should now see
 the phrase `Continent data provided by mod` in Worlds FRVR.
 
-*Note: The Worlds Mod API currently works only in Firefox and Chrome.*
+Notes:
+* The *Worlds Mod API* currently works only in Firefox and Chrome, so you can only preview your map in Worlds on those browsers
+* There are plenty of ways to generate very poor maps that may crash the Worlds client upon anyone trying to visit your world.  If your map crashes in Worlds, just delete your world and try again =).
 
 This demo is built on the [Javascript libGlov/GLOV.js framework](https://github.com/Jimbly/glovjs)
 
