@@ -17,7 +17,7 @@ Making your own continent generator mod
 =======================================
 
 ```html
-  <script src="https://worlds.frvr.com/modapi/worlds_mod_api.bundle.js"></script>
+  <script src="//worlds.frvr.com/modapi/worlds_mod_api.bundle.js"></script>
 ```
 ```javascript
   let mapi = window.worldsModAPI();
