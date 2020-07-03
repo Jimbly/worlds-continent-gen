@@ -1,3 +1,6 @@
+//////////////////////////////////////////////////////////////////////////////////
+// Code provided for example purposes only with no license for use or distribution
+
 // Additional serialization methods and comparison, that were not significantly
 //   better.
 

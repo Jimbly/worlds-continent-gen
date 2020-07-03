@@ -1,3 +1,5 @@
+//////////////////////////////////////////////////////////////////////////////////
+// Code provided for example purposes only with no license for use or distribution
 const assert = require('assert');
 const { abs } = Math;
 const { randCreate } = require('./glov/rand_alea.js');

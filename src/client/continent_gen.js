@@ -1,3 +1,5 @@
+//////////////////////////////////////////////////////////////////////////////////
+// Code provided for example purposes only with no license for use or distribution
 /*eslint no-labels:off */
 const assert = require('assert');
 const { abs, atan2, ceil, cos, max, min, floor, round, pow, sin, sqrt, PI } = Math;

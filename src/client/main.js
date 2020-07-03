@@ -1,3 +1,6 @@
+// Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
+// Released under MIT License: https://opensource.org/licenses/MIT
+
 /*eslint global-require:off, no-labels:off*/
 const glov_local_storage = require('./glov/local_storage.js');
 glov_local_storage.storage_prefix = 'macrogen'; // Before requiring anything else that might load from this

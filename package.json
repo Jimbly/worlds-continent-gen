@@ -22,7 +22,7 @@
   "contributors": [
     "Jimb Esser (https://github.com/Jimbly)"
   ],
-  "license": "MIT",
+  "license": "UNLICENSED",
   "dependencies": {
     "@jimbly/howler": "0.0.6",
     "dot-prop": "^4.2.0",

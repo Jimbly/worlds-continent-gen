@@ -36,3 +36,9 @@ Making your own continent generator mod
   });
 
 ```
+
+License
+=======
+GLOV.js and the Worlds Mod API are distributed under the MIT License.
+
+Other code in this repo is provided for example purposes only, and no license is granted at this time.
