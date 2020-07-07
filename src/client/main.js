@@ -26,6 +26,7 @@ const input = require('./glov/input.js');
 const { linkText } = require('./glov/link.js');
 const { min, floor, round, sqrt } = Math;
 const net = require('./glov/net.js');
+const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS } = require('./proc_gen_constants.js');
 const shaders = require('./glov/shaders.js');
 const sprites = require('./glov/sprites.js');
 const textures = require('./glov/textures.js');
@@ -33,7 +34,7 @@ const ui = require('./glov/ui.js');
 const { clamp, clone } = require('../common/util.js');
 const {
   vec2, v2mul, v2sub,
-  v3set,
+  vec3, v3lerp, v3scale, v3set,
   vec4,
 } = require('./glov/vmath.js');
 
@@ -97,7 +98,7 @@ export function main() {
   const createSprite = sprites.create;
 
   let modes = {
-    view: 3,
+    view: 7,
     edit: 0,
   };
 
@@ -214,6 +215,55 @@ export function main() {
       if (opts.classif.show_rivers) {
         view_mode = 3;
       }
+    } else if (view_mode === 7) {
+      const water_c0 = vec3(0, 0.08, 0.6);
+      const water_c1 = vec3(0.012, 0.39, 1);
+      let total_range = opts.output.land_range;
+      const w2 = 0.5;
+      const weights = [w2, -w2, -1, -w2, w2, 1];
+      let slope_mul = 8 / total_range;
+      const SNOW_ELEVATION = 900 * 4;
+
+      for (let y = 0; y < height; ++y) {
+        for (let x = 0; x < width; ++x) {
+          let pos = y * width + x;
+          let c = classif[pos];
+          let is_land = land[pos];
+          let elev2 = elev[pos];
+          let right_slope = 0; // if positive, slopes down to the right
+          let neighbors = continent_gen.neighbors_bit[x & 1];
+          for (let ii = 0; ii < 6; ++ii) {
+            let npos = pos + neighbors[ii];
+            let nelev = elev[npos];
+            let w = weights[ii];
+            if (land[npos] !== is_land) {
+              w *= 0.25;
+            }
+            let delta = (elev2 - nelev) * w;
+            right_slope += delta;
+          }
+          let v = clamp(0.5 + right_slope * slope_mul, 0.1, 1);
+          if (c === C_WATER) {
+            v3lerp(color, seaColor(pos), water_c0, water_c1);
+            v = 0.85 + v * 0.15;
+          } else if (elev2 - opts.output.sea_range > SNOW_ELEVATION) {
+            v3set(color, 1, 1, 1);
+          } else if (c === C_MOUNTAINS) {
+            v3set(color, 0.7, 0.7, 0.7);
+          } else if (c === C_PLAINS) {
+            v3set(color, 0.4, 1, 0);
+          } else { // c === C_HILLS
+            v3set(color, 0.78, 0.8, 0);
+          }
+          v3scale(color, color, v);
+          for (let jj = 0; jj < 4; ++jj) {
+            tex_data_color[pos * 4 + jj] = clamp(color[jj] * 255, 0, 255);
+          }
+        }
+      }
+
+      // color + rivers
+      view_mode = 3;
     }
 
     // interleave data
@@ -310,6 +360,8 @@ export function main() {
       let w = min(camera2d.w(), camera2d.h());
       let x = camera2d.x1() - w * HEX_ASPECT;
       let y = camera2d.y0();
+      hex_param[2] = 0.5 / (w * camera2d.yScale() / hex_tex_size);
+      hex_param[3] = 1 / hex_param[2];
       debug_sprite.draw({
         x, y, w, h: w,
         z: Z.UI - 10,
@@ -516,6 +568,7 @@ export function main() {
     modeButton('view', 'humid', 4);
     modeButton('view', 'classif', 6);
     modeButton('view', 'biomes', 5);
+    modeButton('view', 'map', 7);
     y += button_spacing;
     x = x0;
     ui.print(style_labels, x, y + 2, Z.UI, 'Edit:');

@@ -159,7 +159,7 @@ let debug_priority;
 let total_size;
 let width;
 let height;
-let neighbors_bit;
+export let neighbors_bit;
 let state;
 
 function setupWorkBuffers(hex_tex_size) {

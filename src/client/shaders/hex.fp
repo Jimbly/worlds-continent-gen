@@ -101,27 +101,24 @@ void main(void) {
     fracx = fracx * 0.75 + 0.25;
     float r = 0.0;
     vec2 pt = vec2(fracx, fracy);
+    float RHWIDTH = min(strahler * 0.04, 0.24) + hex_param.z;
     float dist = pointLineDist(vec2(0.5, 0.0), vec2(0.0, 1.0), pt);
-    float RHWIDTH = min(strahler * 0.04, 0.24);
-    if (dist < RHWIDTH) {
-      r += dot(bits1.wx, vec2(fracy < 0.5 ? 1.0 : 0.0, fracy < 0.5 ? 0.0 : 1.0));
-    }
+    float mul = hex_param.w * 0.5;
+    float v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
+    r = max(r, v * dot(bits1.wx, vec2(fracy < 0.5 ? 1.0 : 0.0, fracy < 0.5 ? 0.0 : 1.0)));
     dist = pointLineDist(vec2(-0.25, 0.0), vec2(0.83205, 0.5547), pt);
-    if (dist < RHWIDTH) {
-      r += dot(vec2(bits2.x, bits1.y), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0));
-    }
+    v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
+    r = max(r, v * dot(vec2(bits2.x, bits1.y), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0)));
     dist = pointLineDist(vec2(1.25, 0.0), vec2(-0.83205, 0.5547), pt);
-    if (dist < RHWIDTH) {
-      r += dot(vec2(bits2.y, bits1.z), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0));
-    }
+    v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
+    r = max(r, v * dot(vec2(bits2.y, bits1.z), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0)));
     dist = distance(pt, vec2(0.5, 0.5));
-    if (dist < RHWIDTH*1.1 && bits_source > 0.0) {
-      r++;
-    }
+    v = clamp(((RHWIDTH - hex_param.z) * 1.1 + hex_param.z - dist) * mul, 0.0, 1.0);
+    r = max(r, v * clamp(bits_source, 0.0, 1.0));
 
-    if (r > 0.01) {
-      color.rgb = vec3(0.0, 0.0, strahler * 48.0);
-    }
+    r *= min(1.0, strahler * 0.25);
+
+    color.rgb = mix(color.rgb, vec3(0.0, 0.0, 1.0), r);
   }
   if (ix < 0.0 || ix >= hex_param.x || iy < 0.0 || iy >= hex_param.x) {
     alpha = 0.0;
