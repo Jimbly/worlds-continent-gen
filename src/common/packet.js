@@ -867,15 +867,13 @@ PacketDebug.prototype.contents = function () {
     // write packet, just combine and reset location when done
     pak.makeReadable();
     ret.push('bufs');
-  } else if (pak.buf) {
+  } else {
     // read packet, or write packet that is a single buf
     if (pak.readable) {
       read_len = pak.buf_len;
     }
+    assert(pak.buf);
     pak.buf_offs = 0;
-  } else {
-    ret.push('empty');
-    read_len = -1;
   }
   let saved_ref_count = pak.ref_count;
   pak.ref(); // prevent auto pooling

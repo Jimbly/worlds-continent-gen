@@ -213,7 +213,11 @@ SubscriptionManager.prototype.handleConnect = function () {
     });
   } else {
     // Try auto-login
-    if (local_storage.get('name') && local_storage.get('password')) {
+    if (window.FBInstant) {
+      this.loginFacebook(function () {
+        // ignore error on auto-login
+      });
+    } else if (local_storage.get('name') && local_storage.get('password')) {
       this.login(local_storage.get('name'), local_storage.get('password'), function () {
         // ignore error on auto-login
       });
@@ -417,6 +421,11 @@ SubscriptionManager.prototype.login = function (username, password, resp_func) {
   });
 };
 
+SubscriptionManager.prototype.loginFacebook = function (resp_func) { // FRVR
+  this.login_credentials = { fb: true };
+  return this.loginInternal(this.login_credentials, resp_func);
+};
+
 SubscriptionManager.prototype.userCreate = function (params, resp_func) {
   params.user_id = (params.user_id || '').trim();
   if (!params.user_id) {
@@ -480,6 +489,10 @@ SubscriptionManager.prototype.logout = function () {
   });
 };
 
+SubscriptionManager.prototype.serverLog = function (type, data) {
+  this.client.send('log', { type, data });
+};
+
 SubscriptionManager.prototype.sendCmdParse = function (command, resp_func) {
   let self = this;
   let channel_ids = Object.keys(self.channels);
@@ -493,6 +506,7 @@ SubscriptionManager.prototype.sendCmdParse = function (command, resp_func) {
       channel = self.channels[channel_id];
     } while (channel_id && (!channel || !(channel.subscriptions || channel.autosubscribed)));
     if (!channel_id) {
+      self.serverLog('cmd_parse_unknown', command);
       return resp_func(last_error);
     }
     return channel.send('cmdparse', command, { silent_error: 1 },

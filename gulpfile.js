@@ -3,36 +3,60 @@ const args = require('yargs').argv;
 const assert = require('assert');
 const babel = require('gulp-babel');
 const babelify = require('babelify');
-const browserify = require('browserify');
 const browser_sync = require('browser-sync');
+const browserify = require('browserify');
+const chalk = require('chalk');
 const clean = require('gulp-clean');
+const concat = require('gulp-concat');
 const eslint = require('gulp-eslint');
 const fs = require('fs');
 const gulp = require('gulp');
 const gulpif = require('gulp-if');
 const ifdef = require('gulp-ifdef');
 const ignore = require('gulp-ignore');
+const json5 = require('./gulp/json5.js');
 const lazypipe = require('lazypipe');
+const ll = require('./gulp/ll.js');
 const log = require('fancy-log');
-const useref = require('gulp-useref');
-const uglify = require('gulp-uglify');
 const newer = require('gulp-newer');
 const nodemon = require('gulp-nodemon');
 const rename = require('gulp-rename');
 const replace = require('gulp-replace');
 const sourcemaps = require('gulp-sourcemaps');
-const web_compress = require('gulp-web-compress');
+const taskLog = require('./gulp/task-log.js');
+const through = require('through2');
+const uglify = require('@jimbly/gulp-uglify');
+const useref = require('gulp-useref');
 const vinyl_buffer = require('vinyl-buffer');
 const vinyl_source_stream = require('vinyl-source-stream');
+const warn_match = require('./gulp/warn-match.js');
 const watchify = require('watchify');
+const web_compress = require('gulp-web-compress');
 const webfs = require('./gulp/webfs_build.js');
 const zip = require('gulp-zip');
+
+ll.tasks(['eslint']);
+
+if (args.ll === false && !args.noserial) {
+  // With --no-ll, absolutely no parallelism, for profiling
+  gulp.reallyparallel = gulp.series;
+} else {
+  gulp.reallyparallel = gulp.parallel;
+}
+if (!args.noserial) {
+  // Since this process is primarily parsing/CPU-bound, using gulp.parallel only confuses
+  //   the output without any speed increase (possibly speed decrease)
+  gulp.parallel = gulp.series;
+}
 
 //////////////////////////////////////////////////////////////////////////
 // Server tasks
 const config = {
   server_js_files: ['src/**/*.js', '!src/client/**/*.js'],
+  server_static: ['src/**/common/words/*.gkg', 'src/**/config/*.json'],
   all_js_files: ['src/**/*.js', '!src/client/vendor/**/*.js'],
+  client_js_files: ['src/**/*.js', '!src/server/**/*.js', '!src/client/vendor/**/*.js'],
+  client_json_files: ['src/**/*.json', '!src/server/**/*.json', '!src/client/vendor/**/*.json'],
   client_html: ['src/client/**/*.html'],
   client_html_index: ['src/client/**/index.html'],
   client_css: ['src/client/**/*.css', '!src/client/sounds/Bfxr/**'],
@@ -61,15 +85,20 @@ const config = {
     'src/client/autogen/**',
     'src/client/shaders/**',
     'src/client/glov/shaders/**',
+    'src/client/glov/models/box_textured_embed.glb',
+    'src/client/glov/words/*.txt',
+    'src/common/words/*.gkg',
     '!src/client/autogen/placeholder.txt',
     '!src/client/autogen/*.js',
   ],
 };
 
-// At least keep function names to get good callstacks
-// const uglify_options = { keep_fnames: true };
-// Do no significant minification to make debugging easier, better error reports
-const uglify_options = { compress: false, mangle: false };
+// Currently, do no significant minification to make debugging easier, better error reports
+// But, at least keep function names to get good callstacks
+// TODO: One, global-scoped uglify pass on bundled file just for prod builds?
+const uglify_options = { compress: false, keep_fnames: true, mangle: false };
+// Different options for external (node_modules / deps.js):
+const uglify_options_ext = { compress: true, keep_fnames: false, mangle: true };
 
 // if (args.debug) {
 //   const node_inspector = require('gulp-node-inspector'); // eslint-disable-line global-require
@@ -83,20 +112,71 @@ const uglify_options = { compress: false, mangle: false };
 //   });
 // }
 
-gulp.task('server_js', function () {
-  return gulp.src(config.server_js_files)
-    .pipe(sourcemaps.init())
+gulp.task('server_static', function () {
+  return gulp.src(config.server_static)
     .pipe(newer('./dist/game/build.dev'))
-    .pipe(babel())
-    .pipe(sourcemaps.write('.'))
     .pipe(gulp.dest('./dist/game/build.dev'));
 });
 
-gulp.task('eslint', function () {
-  return gulp.src(config.all_js_files)
-    .pipe(eslint())
-    .pipe(eslint.format());
-});
+function targetedStream(options, body) {
+  let start = Date.now();
+  let { label, obj, output, src } = options;
+  if (typeof obj === 'function') { // Called as a task, not a 'change' event
+    obj = null;
+  }
+  let stream = gulp.src(obj ? obj : src, { base: 'src/' });
+  if (!obj) {
+    // on startup only
+    if (output) {
+      stream = stream.pipe(newer(output));
+      stream = stream.pipe(taskLog(`  ${label}`));
+    }
+  } else {
+    label = `${label}:${obj.slice(4).replace(/\\/g, '/')}`;
+    log(`Reprocessing '${chalk.cyan(`${label}`)}'...`);
+  }
+  stream = body(stream);
+  if (output) {
+    stream = stream.pipe(gulp.dest(output));
+  }
+  if (obj) {
+    stream = stream.pipe(through.obj((file, enc, callback) => {
+      callback(null, file);
+    }, () => {
+      log(`Reprocessed  '${chalk.cyan(`${label}`)}' in ${chalk.magenta(`${Date.now() - start} ms`)}`);
+    }));
+  }
+  return stream;
+}
+
+function serverJS(obj) {
+  return targetedStream({
+    label: 'server_js',
+    obj,
+    output: './dist/game/build.dev',
+    src: config.server_js_files,
+  }, function (stream) {
+    return stream.pipe(sourcemaps.init())
+      .pipe(babel())
+      .pipe(sourcemaps.write('.'));
+  });
+}
+gulp.task('server_js', serverJS);
+
+function eslintTask(obj) {
+  // TODO: Cache results, on reprocess display all previous errors for all files (need to catch removed files?)
+  return targetedStream({
+    label: 'eslint',
+    obj,
+    src: ['src/**/*.js', '!src/client/vendor/**/*.js']
+  }, function (stream) {
+    return stream.pipe(eslint())
+      .pipe(eslint.format());
+  });
+}
+
+// This task runs in a parallel process
+gulp.task('eslint', eslintTask);
 
 //////////////////////////////////////////////////////////////////////////
 // client tasks
@@ -128,11 +208,15 @@ extra_index.forEach(function (elem) {
   client_html_tasks.push(name);
   gulp.task(name, function () {
     return gulp.src(config.client_html_index)
-      .pipe(useref({}, lazypipe().pipe(sourcemaps.init, { loadMaps: true })))
+      //.pipe(useref({}, lazypipe().pipe(sourcemaps.init, { loadMaps: true })))
       .on('error', log.error.bind(log, 'client_html Error'))
       .pipe(ifdef(elem.defines, { extname: ['html'] }))
       .pipe(rename(`index_${elem.name}.html`))
-      .pipe(sourcemaps.write('./')) // writes .map file
+      .pipe(replace(/<!-- build:js ([^.]+\.js) -->[^!]+<!-- endbuild -->/g, function (a, b) {
+        // already bundled in client_html_default, just export filename reference
+        return `<script src="${b}"></script>`;
+      }))
+      //.pipe(sourcemaps.write('./')) // writes .map file
       .pipe(gulp.dest('./dist/game/build.dev/client'));
   });
 });
@@ -157,56 +241,124 @@ gulp.task('client_fsdata', function () {
     .pipe(gulp.dest('./dist/game/build.dev/client'));
 });
 
-//////////////////////////////////////////////////////////////////////////
-// Fork of https://github.com/Jam3/brfs-babel that adds bablerc:false
-const babel_core = require('babel-core');
-const through = require('through2');
-const babel_static_fs = require('babel-plugin-static-fs');
-function babelBrfs(filename, opts) {
-  let input = '';
-  if ((/\.json$/iu).test(filename)) {
-    return through();
-  }
-
-  function write(buf, enc, next) {
-    input += buf.toString();
-    next();
-  }
-
-  function flush(next) {
-    let result;
-    try {
-      result = babel_core.transform(input, {
-        plugins: [
-          [
-            babel_static_fs, {
-              // ensure static-fs files are discovered
-              onFile: this.emit.bind(this, 'file'),
-              dynamic: false,
-            }
-          ]
-        ],
-        filename: filename,
-        babelrc: false,
-      });
-      this.push(result.code);
-      this.push(null);
-      return next();
-    } catch (err) {
-      return next(err);
-    }
-  }
-
-  return through(write, flush);
-}
-// End fork of https://github.com/Jam3/brfs-babel
-//////////////////////////////////////////////////////////////////////////
-
 let client_js_deps = [];
-let client_js_watch_deps = [];
+client_js_deps.push('client_json');
+client_js_deps.push('client_js_babel');
+let client_js_watch_deps = client_js_deps.slice(0);
 
-function bundleJS(filename, is_worker, pre_task) {
-  let bundle_name = filename.replace('.js', '.bundle.js');
+function bundleJS(filename, is_worker) {
+  let bundle_name = filename.replace('.js', is_worker ? '.bundle.int.js' : '.bundle.js');
+  let do_version = !is_worker;
+  const browserify_opts = {
+    entries: [
+      `./dist/game/build.intermediate/client/${filename}`,
+    ],
+    cache: {}, // required for watchify
+    packageCache: {}, // required for watchify
+    debug: true,
+    transform: [],
+    bundleExternal: false,
+  };
+
+  let build_timestamp = Date.now();
+  function buildTimestampReplace() {
+    // Must be exactly 'BUILD_TIMESTAMP'.length (15) characters long
+    let ret = `'${build_timestamp}'`;
+    assert.equal(ret.length, 15);
+    return ret;
+  }
+  function dobundle(b) {
+    build_timestamp = Date.now();
+    log(`Using BUILD_TIMESTAMP=${build_timestamp} for ${filename}`);
+    // These only log anything useful on the first run, do not catch newly added dependencies:
+    // let external_deps = {};
+    // b.pipeline.get('deps').push(through2.obj(function (entry, enc, next) {
+    //   console.log(entry.deps);
+    //   for (let key in entry.deps) {
+    //     if (key[0] !== '.') {
+    //       external_deps[key] = true;
+    //       entry.deps[key] = false;
+    //     }
+    //   }
+    //   next(null, entry);
+    // }, function (next) {
+    //   console.log('External deps', external_deps);
+    //   next();
+    // }));
+    // b.pipeline.get('emit-deps').push(through2.obj(function (entry, enc, next) {
+    //   console.log(entry.file, entry.deps);
+    //   next(null, entry);
+    // }, function (next) {
+    //   next();
+    // }));
+    let stream = b
+      .bundle()
+      // log errors if they happen
+      .on('error', log.error.bind(log, 'Browserify Error'))
+      .pipe(vinyl_source_stream(bundle_name))
+      .pipe(vinyl_buffer())
+      .pipe(sourcemaps.init({ loadMaps: true })); // loads map from browserify file
+    if (do_version) {
+      stream = stream.pipe(replace('BUILD_TIMESTAMP', buildTimestampReplace));
+    }
+    if (is_worker) {
+      // Not as useful as old method of browserify hard-stop, but better than nothing?
+      stream = stream.pipe(warn_match({
+        'Worker requiring not_worker': /not_worker/,
+      }));
+    }
+    stream = stream
+      .pipe(sourcemaps.write(is_worker ? undefined : './')) // embeds or writes .map file
+      .pipe(gulp.dest(is_worker ? './dist/game/build.intermediate/worker/' : './dist/game/build.dev/client/'));
+    return stream;
+  }
+
+  function writeVersion(done) {
+    let ver_filename = `${filename.slice(0, -3)}.ver.json`;
+    fs.writeFile(`./dist/game/build.dev/client/${ver_filename}`, `{"ver":"${build_timestamp}"}`, done);
+  }
+  let version_task = `client_js_${filename}_version`;
+  if (do_version) {
+    gulp.task(version_task, writeVersion);
+  }
+
+  function registerTasks(b, watch) {
+    let task_base = `client_js${watch ? '_watch' : ''}_${filename}`;
+    b.on('log', log); // output build logs to terminal
+    if (watch) {
+      client_js_watch_deps.push(task_base);
+    } else {
+      client_js_deps.push(task_base);
+    }
+    gulp.task(`${task_base}_bundle`, function () {
+      let ret = dobundle(b);
+      if (watch) {
+        ret = ret.pipe(browser_sync.stream({ once: true }));
+      }
+      return ret;
+    });
+    let task_list = [];
+    task_list.push(`${task_base}_bundle`);
+    if (do_version) {
+      task_list.push(version_task);
+    }
+    gulp.task(task_base, gulp.series(...task_list));
+  }
+  const watched = watchify(browserify(browserify_opts));
+  registerTasks(watched, true);
+  // on any dep update, runs the bundler
+  let on_update = [`client_js_watch_${filename}_bundle`];
+  if (do_version) {
+    on_update.push(writeVersion);
+  }
+  watched.on('update', gulp.series(...on_update));
+
+  const nonwatched = browserify(browserify_opts);
+  registerTasks(nonwatched, false);
+}
+
+function bundleDeps(filename, is_worker) {
+  let bundle_name = filename.replace('.js', is_worker ? '.bundle.int.js' : '.bundle.js');
   const browserify_opts = {
     entries: [
       `./src/client/${filename}`,
@@ -222,60 +374,33 @@ function bundleJS(filename, is_worker, pre_task) {
       _process: './src/client/shims/empty.js',
     },
     debug: true,
-    transform: [babelBrfs]
+    transform: [],
   };
   const babelify_opts = {
-    global: true, // Required because dot-prop has ES6 code in it
-    plugins: [],
-    // plugins: [
-    //   // ['syntax-object-rest-spread', {}],
-    //   // ['transform-object-rest-spread', {}],
-    //   // ['static-fs', {}], - generates good code, but does not allow reloading/watchify
-    // ],
+    global: true, // Required because some modules (e.g. dot-prop) have ES6 code in it
+    // For some reason this is not getting picked up from .babelrc for modules!
+    presets: [
+      ['@babel/env', {
+        'targets': {
+          'ie': '10'
+        },
+        'loose': true,
+      }]
+    ],
   };
-  function whitespaceReplace(a) {
-    // gulp-replace-with-sourcemaps doens't seem to work, so just replace with exactly matching whitespace
-    return a.replace(/[^\n\r]/g, ' ');
-  }
 
-
-  let build_timestamp = Date.now();
-  function buildTimestampReplace() {
-    // Must be exactly 'BUILD_TIMESTAMP'.length (15) characters long
-    let ret = `'${build_timestamp}'`;
-    assert.equal(ret.length, 15);
-    return ret;
-  }
   function dobundle(b) {
-    build_timestamp = Date.now();
-    log(`Using BUILD_TIMESTAMP=${build_timestamp} for ${filename}`);
     return b
-      //.transform(babelify, babelify_opts)
       .bundle()
       // log errors if they happen
       .on('error', log.error.bind(log, 'Browserify Error'))
       .pipe(vinyl_source_stream(bundle_name))
-      // optional, remove if you don't need to buffer file contents
       .pipe(vinyl_buffer())
-      // optional, remove if you don't want sourcemaps
       .pipe(sourcemaps.init({ loadMaps: true })) // loads map from browserify file
-      // Remove extra Babel stuff that does not help anything
-      .pipe(replace(/_classCallCheck\([^)]+\);|exports\.__esModule = true;/g, whitespaceReplace))
-      .pipe(replace(/function _classCallCheck\((?:[^}]*\}){2}/g, whitespaceReplace))
-      .pipe(replace(/Object\.defineProperty\(exports, "__esModule"[^}]+\}\);/g, whitespaceReplace))
-      .pipe(replace('BUILD_TIMESTAMP', buildTimestampReplace))
-      // Add transformation tasks to the pipeline here.
-      .pipe(uglify(uglify_options))
-      .pipe(sourcemaps.write('./')) // writes .map file
-      .pipe(gulp.dest('./dist/game/build.dev/client/'));
+      .pipe(uglify(uglify_options_ext))
+      .pipe(sourcemaps.write(is_worker ? undefined : './')) // embeds or writes .map file
+      .pipe(gulp.dest(is_worker ? './dist/game/build.intermediate/worker/' : './dist/game/build.dev/client/'));
   }
-
-  function writeVersion(done) {
-    let ver_filename = `${filename.slice(0, -3)}.ver.json`;
-    fs.writeFile(`./dist/game/build.dev/client/${ver_filename}`, `{"ver":"${build_timestamp}"}`, done);
-  }
-  let version_task = `client_js_${filename}_version`;
-  gulp.task(version_task, writeVersion);
 
   function registerTasks(b, watch) {
     let task_base = `client_js${watch ? '_watch' : ''}_${filename}`;
@@ -286,29 +411,93 @@ function bundleJS(filename, is_worker, pre_task) {
     } else {
       client_js_deps.push(task_base);
     }
-    gulp.task(`${task_base}_bundle`, function () {
+    gulp.task(task_base, function () {
       let ret = dobundle(b);
       if (watch) {
         ret = ret.pipe(browser_sync.stream({ once: true }));
       }
       return ret;
     });
-    if (pre_task) {
-      gulp.task(task_base, gulp.series(pre_task, `${task_base}_bundle`, version_task));
-    } else {
-      gulp.task(task_base, gulp.series(`${task_base}_bundle`, version_task));
-    }
   }
   const watched = watchify(browserify(browserify_opts));
   registerTasks(watched, true);
   // on any dep update, runs the bundler
-  watched.on('update', gulp.series(`client_js_watch_${filename}_bundle`, writeVersion));
+  watched.on('update', gulp.series(`client_js_watch_${filename}`));
 
   const nonwatched = browserify(browserify_opts);
   registerTasks(nonwatched, false);
 }
 
-bundleJS('app.js');
+function registerBundle(entrypoint, deps, is_worker) {
+  bundleJS(entrypoint, is_worker);
+  bundleDeps(deps, is_worker);
+  // Just for workers, combine the deps and and entrypoint together (slower, but required)
+  if (is_worker) {
+    let task_name = `client_js_${entrypoint}_final`;
+    client_js_deps.push(task_name);
+    client_js_watch_deps.push(task_name);
+    let src_files = [
+      `./dist/game/build.intermediate/worker/${deps.replace('.js', '.bundle.int.js')}`,
+      `./dist/game/build.intermediate/worker/${entrypoint.replace('.js', '.bundle.int.js')}`,
+    ];
+    gulp.task(task_name, function () {
+      return gulp.src(src_files)
+        .pipe(sourcemaps.init({ loadMaps: true }))
+        .pipe(concat(entrypoint.replace('.js', '.bundle.js')))
+        .pipe(sourcemaps.write('./'))
+        .pipe(gulp.dest('./dist/game/build.dev/client/'));
+    });
+    let watch_task_name = `${task_name}_watch`;
+    client_js_watch_deps.push(watch_task_name);
+    gulp.task(watch_task_name, function (done) {
+      gulp.watch(src_files, gulp.series(task_name));
+      done();
+    });
+  }
+}
+registerBundle('app.js', 'app_deps.js', false);
+// registerBundle('worker.js', 'worker_deps.js', true);
+
+function clientBabel(obj) {
+  return targetedStream({
+    label: 'client_js_babel',
+    obj,
+    output: './dist/game/build.intermediate',
+    src: config.client_js_files,
+  }, function (stream) {
+    return stream
+      .pipe(sourcemaps.init())
+      .pipe(sourcemaps.identityMap())
+      .pipe(babel({
+        plugins: [
+          // Note: Dependencies are not tracked from babel plugins, so use
+          //   `webfs` instead of `static-fs` where possible
+          ['static-fs', {}], // generates good code, but does not allow reloading/watchify
+        ]
+      }))
+      .on('error', log.error.bind(log, 'Error'))
+      // Remove extra Babel stuff that does not help anything
+      .pipe(replace(/_classCallCheck\([^)]+\);\n|exports\.__esModule = true;|function _classCallCheck\((?:[^}]*\}){2}\n/g, ''))
+      // Add filter that checks for "bad" transforms happening:
+      .pipe(warn_match({
+        'Spread constructor param': /isNativeReflectConstruct/,
+        'Bad babel': /__esModule/,
+      }))
+
+      .pipe(uglify(uglify_options))
+      .pipe(sourcemaps.write());
+  });
+}
+
+gulp.task('client_js_babel', clientBabel);
+
+gulp.task('client_json', function () {
+  return gulp.src(config.client_json_files)
+    .pipe(newer('./dist/game/build.intermediate'))
+    // Minify, and convert from json5
+    .pipe(json5({ beautify: false }))
+    .pipe(gulp.dest('./dist/game/build.intermediate'));
+});
 
 gulp.task('build.prod.compress', function () {
   return gulp.src('dist/game/build.dev/**')
@@ -353,42 +542,62 @@ gulp.task('client_js_watch', gulp.parallel(...client_js_watch_deps));
 //////////////////////////////////////////////////////////////////////////
 // Combined tasks
 
-gulp.task('client_fsdata_wrap', gulp.series('client_fsdata'));
+gulp.task('client_fsdata_wrap', gulp.series(
+  'client_fsdata'));
 
-gulp.task('build', gulp.series(gulp.parallel('eslint', 'server_js', 'client_html',
-  'client_css', 'client_static', 'client_js', 'client_fsdata_wrap'), 'build.prod'));
+const build_misc_nolint = [
+  'server_static',
+  'server_js',
+  'client_html',
+  'client_css',
+  'client_static',
+  'client_fsdata_wrap',
+];
+
+if (args.nolint) {
+  gulp.task('build_deps', gulp.parallel(...build_misc_nolint, 'client_js'));
+  gulp.task('watch_deps', gulp.parallel(...build_misc_nolint, 'client_js_watch'));
+} else {
+  gulp.task('build_deps', gulp.reallyparallel('eslint', gulp.parallel(...build_misc_nolint, 'client_js')));
+  gulp.task('watch_deps', gulp.reallyparallel('eslint', gulp.parallel(...build_misc_nolint, 'client_js_watch')));
+}
+
+
+gulp.task('build', gulp.series('build_deps', 'build.prod'));
 
 gulp.task('bs-reload', (done) => {
   browser_sync.reload();
   done();
 });
 
-gulp.task('watch', gulp.series(
-  gulp.parallel('eslint', 'server_js', 'client_html', 'client_css', 'client_static',
-    'client_fsdata_wrap', 'client_js_watch'),
-  (done) => {
-    if (!args.nolint) {
-      gulp.watch(config.all_js_files, gulp.series('eslint'));
-    }
-    gulp.watch(config.server_js_files, gulp.series('server_js'));
-    gulp.watch(config.client_html, gulp.series('client_html', 'bs-reload'));
-    gulp.watch(config.client_vendor, gulp.series('client_html', 'bs-reload'));
-    gulp.watch(config.client_css, gulp.series('client_css'));
-    gulp.watch(config.client_static, gulp.series('client_static'));
-    gulp.watch(config.client_fsdata, gulp.series('client_fsdata'));
-    done();
+gulp.task('watch_start', (done) => {
+  // Simple reprocessing that targets everything:
+  gulp.watch(config.server_static, gulp.series('server_static')); // Want to also force server reload?
+  gulp.watch(config.client_html, gulp.series('client_html', 'bs-reload'));
+  gulp.watch(config.client_vendor, gulp.series('client_html', 'bs-reload'));
+  gulp.watch(config.client_css, gulp.series('client_css'));
+  gulp.watch(config.client_static, gulp.series('client_static'));
+  gulp.watch(config.client_fsdata, gulp.series('client_fsdata'));
+  gulp.watch(config.client_json_files, gulp.series('client_json'));
+
+  // More efficient reprocessing watchers that only look at the file that changed:
+  if (!args.nolint) {
+    gulp.watch(config.all_js_files).on('change', eslintTask);
   }
-));
+  gulp.watch(config.server_js_files).on('change', serverJS);
+  gulp.watch(config.client_js_files).on('change', clientBabel);
+
+  done();
+});
+
+gulp.task('watch', gulp.series('watch_deps', 'watch_start'));
 
 const deps = ['watch'];
 if (args.debug) {
   deps.push('inspect');
 }
 
-// Depending on "watch" not because that implicitly triggers this, but
-// just to start up the watcher and reprocessor, and nodemon restarts
-// based on its own logic below.
-gulp.task('nodemon', gulp.series(...deps, (done) => {
+gulp.task('nodemon-start', (done) => {
   const options = {
     script: 'dist/game/build.dev/server/index.js',
     nodeArgs: ['--inspect'],
@@ -400,6 +609,10 @@ gulp.task('nodemon', gulp.series(...deps, (done) => {
     options.nodeArgs.push('--debug');
   }
 
+  if (args.env) {
+    options.args.push(`--env=${args.env}`);
+  }
+
   if (args.port) {
     options.args.push(`--port=${args.port}`);
     assert.equal(options.nodeArgs[0], '--inspect');
@@ -408,10 +621,14 @@ gulp.task('nodemon', gulp.series(...deps, (done) => {
 
   nodemon(options);
   done();
-}));
+});
 
-gulp.task('browser-sync', gulp.series('nodemon', (done) => {
+// Depending on "watch" not because that implicitly triggers this, but
+// just to start up the watcher and reprocessor, and nodemon restarts
+// based on its own logic below.
+gulp.task('nodemon', gulp.series(...deps, 'nodemon-start'));
 
+gulp.task('browser-sync-start', (done) => {
   // for more browser-sync config options: http://www.browsersync.io/docs/options/
   browser_sync({
 
@@ -432,13 +649,14 @@ gulp.task('browser-sync', gulp.series('nodemon', (done) => {
     ghostMode: false,
   });
   done();
-}));
+});
+
+gulp.task('browser-sync', gulp.series('nodemon', 'browser-sync-start'));
 
 gulp.task('clean', function () {
   return gulp.src([
-    'build.dev',
-    'build.prod',
     'dist/game/build.dev',
+    'dist/game/build.intermediate',
     'dist/game/build.prod',
     'src/client/autogen/*.*',
     '!src/client/autogen/placeholder.txt',
