@@ -102,19 +102,28 @@ void main(void) {
     float r = 0.0;
     vec2 pt = vec2(fracx, fracy);
     float RHWIDTH = min(strahler * 0.04, 0.24) + hex_param.z;
-    float dist = pointLineDist(vec2(0.5, 0.0), vec2(0.0, 1.0), pt);
     float mul = hex_param.w * 0.5;
-    float v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
-    r = max(r, v * dot(bits1.wx, vec2(fracy < 0.5 ? 1.0 : 0.0, fracy < 0.5 ? 0.0 : 1.0)));
+    //float mindist = 1.0;
+    float dist = pointLineDist(vec2(0.5, 0.0), vec2(0.0, 1.0), pt);
+    float v = (RHWIDTH - dist) * mul;
+    // Not sure if this form or the dot() form below is better
+    r = max(r, v * ((fracy < 0.5 ? bits1.w : 0.0) + (fracy < 0.5 ? 0.0 : bits1.x)));
+    //mindist = min(mindist, mix(1.0, dist, dot(bits1.wx, vec2(fracy < 0.5 ? 1.0 : 0.0, fracy < 0.5 ? 0.0 : 1.0))));
     dist = pointLineDist(vec2(-0.25, 0.0), vec2(0.83205, 0.5547), pt);
-    v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
+    v = (RHWIDTH - dist) * mul;
     r = max(r, v * dot(vec2(bits2.x, bits1.y), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0)));
+    //mindist = min(mindist, mix(1.0, dist, dot(vec2(bits2.x, bits1.y), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0))));
     dist = pointLineDist(vec2(1.25, 0.0), vec2(-0.83205, 0.5547), pt);
-    v = clamp((RHWIDTH - dist) * mul, 0.0, 1.0);
+    v = (RHWIDTH - dist) * mul;
     r = max(r, v * dot(vec2(bits2.y, bits1.z), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0)));
+    //mindist = min(mindist, mix(1.0, dist, dot(vec2(bits2.y, bits1.z), vec2(fracx < 0.5 ? 1.0 : 0.0, fracx < 0.5 ? 0.0 : 1.0))));
     dist = distance(pt, vec2(0.5, 0.5));
-    v = clamp(((RHWIDTH - hex_param.z) * 1.1 + hex_param.z - dist) * mul, 0.0, 1.0);
+    v = ((RHWIDTH - hex_param.z) * 1.1 + hex_param.z - dist) * mul;
     r = max(r, v * clamp(bits_source, 0.0, 1.0));
+    //mindist = min(mindist, mix(1.0, dist, clamp(bits_source, 0.0, 1.0)));
+    //r = clamp((RHWIDTH - mindist) * mul, 0.0, 1.0);
+
+    r = min(r, 1.0);
 
     r *= min(1.0, strahler * 0.25);
 
