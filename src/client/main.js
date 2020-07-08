@@ -26,7 +26,7 @@ const input = require('./glov/input.js');
 const { linkText } = require('./glov/link.js');
 const { min, floor, round, sqrt } = Math;
 const net = require('./glov/net.js');
-const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS } = require('./proc_gen_constants.js');
+const { C_WATER, C_PLAINS, C_MOUNTAINS } = require('./proc_gen_constants.js');
 const shaders = require('./glov/shaders.js');
 const sprites = require('./glov/sprites.js');
 const textures = require('./glov/textures.js');
@@ -48,6 +48,12 @@ Z.UI_TEST = 200;
 // Virtual viewport for our game logic
 export const game_width = 480;
 export const game_height = 240;
+
+const MAP_WATER_C0 = vec3(0, 0.08, 0.6);
+const MAP_WATER_C1 = vec3(0.012, 0.39, 1);
+const MAP_W2 = 0.5;
+const MAP_WEIGHTS = [MAP_W2, -MAP_W2, -1, -MAP_W2, MAP_W2, 1];
+const SNOW_ELEVATION = 900 * 4;
 
 export function main() {
   if (engine.DEBUG) {
@@ -98,7 +104,7 @@ export function main() {
   const createSprite = sprites.create;
 
   let modes = {
-    view: 7,
+    view: 6,
     edit: 0,
   };
 
@@ -205,46 +211,35 @@ export function main() {
         view_mode = 3;
       }
     } else if (view_mode === 6) {
-      for (let pos = 0; pos < tex_total_size; ++pos) {
-        let c = classif[pos];
-        v3set(color, c > 1 ? 255 : 0, c && c < 3 ? 255 : 0, c ? 0 : 255);
-        for (let jj = 0; jj < 4; ++jj) {
-          tex_data_color[pos * 4 + jj] = color[jj];
-        }
-      }
-      if (opts.classif.show_rivers) {
-        view_mode = 3;
-      }
-    } else if (view_mode === 7) {
-      const water_c0 = vec3(0, 0.08, 0.6);
-      const water_c1 = vec3(0.012, 0.39, 1);
       let total_range = opts.output.land_range;
-      const w2 = 0.5;
-      const weights = [w2, -w2, -1, -w2, w2, 1];
       let slope_mul = 8 / total_range;
-      const SNOW_ELEVATION = 900 * 4;
-
+      let show_relief = opts.classif.show_relief;
       for (let y = 0; y < height; ++y) {
         for (let x = 0; x < width; ++x) {
           let pos = y * width + x;
           let c = classif[pos];
-          let is_land = land[pos];
+          let v = 1;
           let elev2 = elev[pos];
-          let right_slope = 0; // if positive, slopes down to the right
-          let neighbors = continent_gen.neighbors_bit[x & 1];
-          for (let ii = 0; ii < 6; ++ii) {
-            let npos = pos + neighbors[ii];
-            let nelev = elev[npos];
-            let w = weights[ii];
-            if (land[npos] !== is_land) {
-              w *= 0.25;
+          if (show_relief) {
+            let is_land = land[pos];
+            let right_slope = 0;
+            if (y && y !== height - 1 && x && x !== width - 1) {
+              let neighbors = continent_gen.neighbors_bit[x & 1];
+              for (let ii = 0; ii < 6; ++ii) {
+                let npos = pos + neighbors[ii];
+                let nelev = elev[npos];
+                let w = MAP_WEIGHTS[ii];
+                if (land[npos] !== is_land) {
+                  w *= 0.25;
+                }
+                let delta = (elev2 - nelev) * w;
+                right_slope += delta;
+              }
             }
-            let delta = (elev2 - nelev) * w;
-            right_slope += delta;
+            v = clamp(0.5 + right_slope * slope_mul, 0.1, 1);
           }
-          let v = clamp(0.5 + right_slope * slope_mul, 0.1, 1);
           if (c === C_WATER) {
-            v3lerp(color, seaColor(pos), water_c0, water_c1);
+            v3lerp(color, seaColor(pos), MAP_WATER_C0, MAP_WATER_C1);
             v = 0.85 + v * 0.15;
           } else if (elev2 - opts.output.sea_range > SNOW_ELEVATION) {
             v3set(color, 1, 1, 1);
@@ -262,8 +257,9 @@ export function main() {
         }
       }
 
-      // color + rivers
-      view_mode = 3;
+      if (opts.classif.show_rivers) {
+        view_mode = 3;
+      }
     }
 
     // interleave data
@@ -568,7 +564,6 @@ export function main() {
     modeButton('view', 'humid', 4);
     modeButton('view', 'classif', 6);
     modeButton('view', 'biomes', 5);
-    modeButton('view', 'map', 7);
     y += button_spacing;
     x = x0;
     ui.print(style_labels, x, y + 2, Z.UI, 'Edit:');
@@ -740,6 +735,7 @@ export function main() {
       slider('blur_w', 1, 10, 0);
       slider('blur_scale', 0, 1000, 0);
       toggle('show_rivers');
+      toggle('show_relief');
     }
   }
 
