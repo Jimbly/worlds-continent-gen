@@ -43,4 +43,4 @@ License
 =======
 GLOV.js and the Worlds Mod API are distributed under the MIT License.
 
-Other code in this repo is provided for example purposes only, and no license is granted at this time.
+Other code in this repo is provided for example purposes only, Copyright 2020 Jimb Esser, and permission is only granted for use in Worlds FRVR and related mods.
