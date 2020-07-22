@@ -5,7 +5,7 @@ Continent Data Generator for Worlds FRVR
 * Make Maps: [worlds-continent-gen](http://jimbly.github.io/worlds-continent-gen/)
 * Explore in [Worlds FRVR](https://worlds.frvr.com/)
 
-To view the map you made, open Worlds FRVR, accept the mod permissions dialog, log in and create a new world, and choose
+To view the map you made, open Worlds FRVR (over ***https only***), accept the mod permissions dialog, log in and create a new world, and choose
 the "Procedural" world type.  If you click Export in the map maker, you should now see
 the phrase `Continent data provided by mod` in Worlds FRVR under the World Type selection.
 
