@@ -37,6 +37,8 @@ Making your own continent generator mod
 
 ```
 
+All continent data arrays represent a 256x256 array stored in row-major format. Note that each entry in our continent data describes a hexagonal region, using an "if x is odd, shift up" encoding, so array entry index (x + y * 256) describes the hex (x,y) which maps to the cartesian coordinates of (x * √(3/4), y + ((x is odd) ? 0.5 : 0).
+
 License
 =======
 GLOV.js and the Worlds Mod API are distributed under the MIT License.
