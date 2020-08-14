@@ -1,5 +1,6 @@
 //////////////////////////////////////////////////////////////////////////////////
 // Code provided for example purposes only with no license for use or distribution
+// Copyright (c) 2020 Jimb Esser
 /*eslint no-labels:off */
 const assert = require('assert');
 const { abs, atan2, ceil, cos, max, min, floor, round, pow, sin, sqrt, PI } = Math;
@@ -516,6 +517,7 @@ function poissonSample(radius, k) {
 
 function findMaxPerRegion(candidates, map, radius) {
   let ret = [];
+  let used = {};
   for (let ii = 0; ii < candidates.length; ++ii) {
     let pos = candidates[ii];
     let posx = pos % width;
@@ -536,9 +538,19 @@ function findMaxPerRegion(candidates, map, radius) {
         }
       }
     }
-    ret.push([max_elev, max_pos]);
+    if (!used[max_pos]) {
+      used[max_pos] = true;
+      ret.push([max_elev, max_pos]);
+    }
   }
-  ret.sort((a,b) => b[0] - a[0]);
+  ret.sort((a,b) => {
+    let d = b[0] - a[0];
+    if (d) {
+      return d;
+    }
+    assert(b[1] !== a[1]);
+    return b[1] - a[1];
+  });
   return ret;
 }
 
@@ -1733,9 +1745,15 @@ function determineClassification() {
 }
 
 
-export function continentGen(opts_in) {
+export function continentGen(param) {
   let start = Date.now();
-  opts = opts_in;
+  if (typeof param === 'number') {
+    opts = default_opts;
+    opts.seed = param;
+  } else {
+    opts = param;
+    assert.equal(typeof opts.seed, 'number');
+  }
   let { hex_tex_size } = opts;
   let output_debug = opts.output.debug;
   if (hex_tex_size !== last_tex_size) {
