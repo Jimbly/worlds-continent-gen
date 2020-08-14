@@ -8,6 +8,7 @@ const browserify = require('browserify');
 const chalk = require('chalk');
 const clean = require('gulp-clean');
 const concat = require('gulp-concat');
+const console_api = require('console-api');
 const eslint = require('gulp-eslint');
 const fs = require('fs');
 const gulp = require('gulp');
@@ -15,6 +16,7 @@ const gulpif = require('gulp-if');
 const ifdef = require('gulp-ifdef');
 const ignore = require('gulp-ignore');
 const json5 = require('./gulp/json5.js');
+const JSON5 = require('json5');
 const lazypipe = require('lazypipe');
 const ll = require('./gulp/ll.js');
 const log = require('fancy-log');
@@ -35,6 +37,21 @@ const web_compress = require('gulp-web-compress');
 const webfs = require('./gulp/webfs_build.js');
 const zip = require('gulp-zip');
 
+function prettyInterface() {
+  console_api.setPalette(console_api.palettes.desaturated);
+  let project_name = 'glov';
+  try {
+    let pkg = JSON5.parse(fs.readFileSync('./package.json', 'utf8'));
+    if (pkg && pkg.name) {
+      project_name = pkg.name;
+    }
+  } catch (e) {
+    // ignored, use default
+  }
+  console_api.setTitle(args.title || `gulp ${__filename} | ${project_name}`);
+}
+prettyInterface();
+
 ll.tasks(['eslint']);
 
 if (args.ll === false && !args.noserial) {
@@ -53,10 +70,11 @@ if (!args.noserial) {
 // Server tasks
 const config = {
   server_js_files: ['src/**/*.js', '!src/client/**/*.js'],
-  server_static: ['src/**/common/words/*.gkg', 'src/**/config/*.json'],
+  server_static: ['src/**/common/words/*.gkg'],
   all_js_files: ['src/**/*.js', '!src/client/vendor/**/*.js'],
   client_js_files: ['src/**/*.js', '!src/server/**/*.js', '!src/client/vendor/**/*.js'],
-  client_json_files: ['src/**/*.json', '!src/server/**/*.json', '!src/client/vendor/**/*.json'],
+  client_json_files: ['src/client/**/*.json', '!src/client/vendor/**/*.json'],
+  server_json_files: ['src/server/**/*.json'],
   client_html: ['src/client/**/*.html'],
   client_html_index: ['src/client/**/index.html'],
   client_css: ['src/client/**/*.css', '!src/client/sounds/Bfxr/**'],
@@ -68,6 +86,7 @@ const config = {
     'src/client/**/*.png',
     'src/client/**/*.jpg',
     'src/client/**/*.glb',
+    'src/client/**/*.ico',
     '!**/unused/**',
     '!src/client/sounds/Bfxr/**',
     // 'src/client/**/vendor/**',
@@ -181,6 +200,7 @@ gulp.task('eslint', eslintTask);
 //////////////////////////////////////////////////////////////////////////
 // client tasks
 const default_defines = {
+  FACEBOOK: false,
   ENV: 'default',
 };
 gulp.task('client_html_default', function () {
@@ -236,7 +256,7 @@ gulp.task('client_static', function () {
 });
 
 gulp.task('client_fsdata', function () {
-  return gulp.src(config.client_fsdata, { base: 'src/client' })
+  return gulp.src(config.client_fsdata, { base: 'src/client', allowEmpty: true })
     .pipe(webfs())
     .pipe(gulp.dest('./dist/game/build.dev/client'));
 });
@@ -322,17 +342,17 @@ function bundleJS(filename, is_worker) {
     gulp.task(version_task, writeVersion);
   }
 
-  function registerTasks(b, watch) {
-    let task_base = `client_js${watch ? '_watch' : ''}_${filename}`;
+  function registerTasks(b, is_watch) {
+    let task_base = `client_js${is_watch ? '_watch' : ''}_${filename}`;
     b.on('log', log); // output build logs to terminal
-    if (watch) {
+    if (is_watch) {
       client_js_watch_deps.push(task_base);
     } else {
       client_js_deps.push(task_base);
     }
     gulp.task(`${task_base}_bundle`, function () {
       let ret = dobundle(b);
-      if (watch) {
+      if (is_watch) {
         ret = ret.pipe(browser_sync.stream({ once: true }));
       }
       return ret;
@@ -402,18 +422,18 @@ function bundleDeps(filename, is_worker) {
       .pipe(gulp.dest(is_worker ? './dist/game/build.intermediate/worker/' : './dist/game/build.dev/client/'));
   }
 
-  function registerTasks(b, watch) {
-    let task_base = `client_js${watch ? '_watch' : ''}_${filename}`;
+  function registerTasks(b, is_watch) {
+    let task_base = `client_js${is_watch ? '_watch' : ''}_${filename}`;
     b.transform(babelify, babelify_opts);
     b.on('log', log); // output build logs to terminal
-    if (watch) {
+    if (is_watch) {
       client_js_watch_deps.push(task_base);
     } else {
       client_js_deps.push(task_base);
     }
     gulp.task(task_base, function () {
       let ret = dobundle(b);
-      if (watch) {
+      if (is_watch) {
         ret = ret.pipe(browser_sync.stream({ once: true }));
       }
       return ret;
@@ -430,7 +450,9 @@ function bundleDeps(filename, is_worker) {
 
 function registerBundle(entrypoint, deps, is_worker) {
   bundleJS(entrypoint, is_worker);
-  bundleDeps(deps, is_worker);
+  if (deps) {
+    bundleDeps(deps, is_worker);
+  }
   // Just for workers, combine the deps and and entrypoint together (slower, but required)
   if (is_worker) {
     let task_name = `client_js_${entrypoint}_final`;
@@ -493,10 +515,18 @@ gulp.task('client_js_babel', clientBabel);
 
 gulp.task('client_json', function () {
   return gulp.src(config.client_json_files)
-    .pipe(newer('./dist/game/build.intermediate'))
+    .pipe(newer('./dist/game/build.intermediate/client'))
     // Minify, and convert from json5
     .pipe(json5({ beautify: false }))
-    .pipe(gulp.dest('./dist/game/build.intermediate'));
+    .pipe(gulp.dest('./dist/game/build.intermediate/client'));
+});
+
+gulp.task('server_json', function () {
+  return gulp.src(config.server_json_files)
+    .pipe(newer('./dist/game/build.dev/server'))
+    // convert from json5, beautify
+    .pipe(json5({ beautify: true }))
+    .pipe(gulp.dest('./dist/game/build.dev/server'));
 });
 
 gulp.task('build.prod.compress', function () {
@@ -547,6 +577,7 @@ gulp.task('client_fsdata_wrap', gulp.series(
 
 const build_misc_nolint = [
   'server_static',
+  'server_json',
   'server_js',
   'client_html',
   'client_css',
@@ -579,6 +610,7 @@ gulp.task('watch_start', (done) => {
   gulp.watch(config.client_static, gulp.series('client_static'));
   gulp.watch(config.client_fsdata, gulp.series('client_fsdata'));
   gulp.watch(config.client_json_files, gulp.series('client_json'));
+  gulp.watch(config.server_json_files, gulp.series('server_json'));
 
   // More efficient reprocessing watchers that only look at the file that changed:
   if (!args.nolint) {

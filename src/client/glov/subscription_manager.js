@@ -2,9 +2,9 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 
 const assert = require('assert');
-const { cmd_parse } = require('./cmds.js');
 const dot_prop = require('dot-prop');
 const EventEmitter = require('../../common/tiny-events.js');
+const fbinstant = require('./fbinstant.js');
 const local_storage = require('./local_storage.js');
 const md5 = require('../../common/md5.js');
 const { isPacket } = require('../../common/packet.js');
@@ -32,7 +32,7 @@ ClientChannelWorker.prototype.onSubscribe = function (cb) {
   assert(this.subscriptions || this.autosubscribed);
   this.on('subscribe', cb);
   if (this.got_subscribe) {
-    cb(this.data); // eslint-disable-line callback-return
+    cb(this.data);
   }
 };
 
@@ -40,7 +40,7 @@ ClientChannelWorker.prototype.onSubscribe = function (cb) {
 ClientChannelWorker.prototype.onceSubscribe = function (cb) {
   assert(this.subscriptions || this.autosubscribed);
   if (this.got_subscribe) {
-    cb(this.data); // eslint-disable-line callback-return
+    cb(this.data);
   } else {
     this.once('subscribe', cb);
   }
@@ -57,15 +57,15 @@ ClientChannelWorker.prototype.handleChannelData = function (data, resp_func) {
   // Get command list upon first connect
   let channel_type = this.channel_id.split('.')[0];
   let cmd_list = this.subs.cmds_list_by_worker;
-  if (!cmd_list[channel_type]) {
+  if (cmd_list && !cmd_list[channel_type]) {
     cmd_list[channel_type] = {};
-    this.send('cmdparse', 'cmd_list', {}, function (err, resp) {
+    this.send('cmdparse', 'cmd_list', (err, resp) => {
       if (err) { // already unsubscribed?
         console.error(`Error getting cmd_list for ${channel_type}`);
         delete cmd_list[channel_type];
       } else if (resp.found) {
         cmd_list[channel_type] = resp;
-        cmd_parse.addServerCommands(resp.resp);
+        this.subs.cmd_parse.addServerCommands(resp.resp);
       }
     });
   }
@@ -122,17 +122,16 @@ ClientChannelWorker.prototype.pak = function (msg) {
   return pak;
 };
 
-ClientChannelWorker.prototype.send = function (msg, data, opts, resp_func) {
-  assert(typeof opts !== 'function');
+ClientChannelWorker.prototype.send = function (msg, data, resp_func, old_fourth) {
+  assert(!resp_func || typeof resp_func === 'function');
+  assert(!old_fourth);
   this.subs.client.send('channel_msg', {
     channel_id: this.channel_id,
     msg, data,
-    broadcast: opts && opts.broadcast || undefined,
-    silent_error: (opts && opts.silent_error) ? 1 : undefined,
   }, resp_func);
 };
 
-function SubscriptionManager(client) {
+function SubscriptionManager(client, cmd_parse) {
   EventEmitter.call(this);
   this.client = client;
   this.channels = {};
@@ -143,7 +142,10 @@ function SubscriptionManager(client) {
   this.logging_in = false;
   this.logging_out = false;
   this.auto_create_user = false;
-  this.cmds_list_by_worker = {};
+  this.cmd_parse = cmd_parse;
+  if (cmd_parse) {
+    this.cmds_list_by_worker = {};
+  }
 
   this.first_connect = true;
   this.server_time = 0;
@@ -364,10 +366,24 @@ SubscriptionManager.prototype.loginInternal = function (login_credentials, resp_
   }
   this.logging_in = true;
   this.logged_in = false;
-  this.client.send('login', {
-    user_id: login_credentials.user_id,
-    password: md5(this.client.secret + login_credentials.password),
-  }, this.handleLoginResponse.bind(this, resp_func));
+
+  if (login_credentials.fb) {
+    fbinstant.onready(() => {
+      window.FBInstant.player.getSignedPlayerInfoAsync().then((result) => {
+        this.client.send('login_facebook', {
+          signature: result.getSignature(),
+          display_name: window.FBInstant.player.getName(),
+        }, this.handleLoginResponse.bind(this, resp_func));
+      }).catch((err) => {
+        this.handleLoginResponse(resp_func, err);
+      });
+    });
+  } else {
+    this.client.send('login', {
+      user_id: login_credentials.user_id,
+      password: md5(this.client.secret + login_credentials.password),
+    }, this.handleLoginResponse.bind(this, resp_func));
+  }
 };
 
 SubscriptionManager.prototype.userCreateInternal = function (params, resp_func) {
@@ -421,7 +437,7 @@ SubscriptionManager.prototype.login = function (username, password, resp_func) {
   });
 };
 
-SubscriptionManager.prototype.loginFacebook = function (resp_func) { // FRVR
+SubscriptionManager.prototype.loginFacebook = function (resp_func) {
   this.login_credentials = { fb: true };
   return this.loginInternal(this.login_credentials, resp_func);
 };
@@ -509,7 +525,7 @@ SubscriptionManager.prototype.sendCmdParse = function (command, resp_func) {
       self.serverLog('cmd_parse_unknown', command);
       return resp_func(last_error);
     }
-    return channel.send('cmdparse', command, { silent_error: 1 },
+    return channel.send('cmdparse', command,
       function (err, resp) {
         if (err || resp && resp.found) {
           return resp_func(err, resp ? resp.resp : null);
@@ -525,6 +541,6 @@ SubscriptionManager.prototype.sendCmdParse = function (command, resp_func) {
   self.onceConnected(tryNext);
 };
 
-export function create(client) {
-  return new SubscriptionManager(client);
+export function create(client, cmd_parse) {
+  return new SubscriptionManager(client, cmd_parse);
 }

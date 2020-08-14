@@ -61,7 +61,7 @@ class GlovUIEditBox {
     }
     glov_ui.focusSteal(this);
     this.is_focused = true;
-    if (this.pointer_lock) {
+    if (this.pointer_lock && glov_input.pointerLocked()) {
       glov_input.pointerLockExit();
     }
   }
@@ -117,11 +117,11 @@ class GlovUIEditBox {
   run(params) {
     this.applyParams(params);
 
-    if (this.last_frame !== engine.global_frame_index - 1) {
+    if (this.last_frame !== engine.frame_index - 1) {
       // it's been more than a frame, we must have not been running, discard async events
       this.submitted = false;
     }
-    this.last_frame = engine.global_frame_index;
+    this.last_frame = engine.frame_index;
 
     this.canceled = false;
     let focused = this.updateFocus();

@@ -113,7 +113,7 @@ let last_mouse_pos = vec2();
 let mouse_pos_is_touch = false;
 let mouse_over_captured = false;
 let mouse_down = [];
-let mouse_wheel = 0;
+let wheel_events = [];
 let movement_questionable_frames = 0;
 const MOVEMENT_QUESTIONABLE_FRAMES = 2; // Need at least 2
 
@@ -153,6 +153,7 @@ function TouchData(pos, touch, button, event) {
   this.button = button;
   this.start_time = Date.now();
   this.dispatched = false;
+  this.dispatched_drag = false;
   this.dispatched_drag_over = false;
   this.up_edge = 0;
   this.down_edge = 0;
@@ -242,7 +243,7 @@ function eventlog(event) {
     }
     pairs.push(`${k}:${v.id || v}`);
   }
-  console.log(`${engine.global_frame_index} ${event.type} ${pointerLocked()?'ptrlck':'unlckd'} ${pairs.join(',')}`);
+  console.log(`${engine.frame_index} ${event.type} ${pointerLocked()?'ptrlck':'unlckd'} ${pairs.join(',')}`);
 }
 
 function letEventThrough(event) {
@@ -321,6 +322,13 @@ function onKeyDown(event) {
   }
 }
 
+let mouse_move_x = 0;
+export function debugGetMouseMoveX() {
+  let ret = mouse_move_x;
+  mouse_move_x = 0;
+  return ret;
+}
+
 let mouse_moved = false;
 let temp_delta = vec2();
 let last_abs_move = 0;
@@ -354,6 +362,8 @@ function onMouseMove(event, no_stop) {
   //   mouse_pos[1] = event.layerY;
   // }
   mouse_pos_is_touch = false;
+
+  mouse_move_x += (event.movementX || 0);
 
   let any_movement = false;
   if (pointerLocked()) {
@@ -409,7 +419,7 @@ function onMouseDown(event) {
   let no_click = letEventThrough(event);
 
   let button = event.button;
-  mouse_down[button] = mouse_pos.slice(0);
+  mouse_down[button] = true;
   let touch_id = `m${button}`;
   if (touches[touch_id]) {
     v2copy(touches[touch_id].start_pos, mouse_pos);
@@ -454,11 +464,11 @@ function onMouseUp(event) {
 function onWheel(event) {
   onMouseMove(event, true);
   let delta = -event.deltaY || event.wheelDelta || -event.detail;
-  if (delta > 0) {
-    mouse_wheel++;
-  } else if (delta < 0) {
-    mouse_wheel--;
-  }
+  wheel_events.push({
+    pos: [event.pageX, event.pageY],
+    delta: delta > 0 ? 1 : -1,
+    dispatched: false,
+  });
 }
 
 let touch_pos = vec2();
@@ -544,7 +554,7 @@ function onTouchChange(event) {
     } else if (new_count === 1) {
       let touch = ct[0];
       if (!old_count) {
-        mouse_down[0] = vec2(touch.pageX, touch.pageY);
+        mouse_down[0] = true;
       }
       v2set(mouse_pos, touch.pageX, touch.pageY);
       mouse_pos_is_touch = true;
@@ -575,6 +585,14 @@ function genAnalogMap() {
   }
 }
 
+let passive_param = false;
+export function handleTouches(elem) {
+  elem.addEventListener('touchstart', onTouchChange, passive_param);
+  elem.addEventListener('touchmove', onTouchChange, passive_param);
+  elem.addEventListener('touchend', onTouchChange, passive_param);
+  elem.addEventListener('touchcancel', onTouchChange, passive_param);
+}
+
 export function startup(_canvas, params) {
   canvas = _canvas;
   pointer_lock.startup(canvas, onPointerLockEnter);
@@ -584,7 +602,6 @@ export function startup(_canvas, params) {
   pad_to_touch = params.pad_to_touch;
   genAnalogMap();
 
-  let passive_param = false;
   try {
     let opts = Object.defineProperty({}, 'passive', {
       get: function () {
@@ -616,10 +633,7 @@ export function startup(_canvas, params) {
   window.addEventListener('blur', onBlurOrFocus, false);
   window.addEventListener('focus', onBlurOrFocus, false);
 
-  canvas.addEventListener('touchstart', onTouchChange, passive_param);
-  canvas.addEventListener('touchmove', onTouchChange, passive_param);
-  canvas.addEventListener('touchend', onTouchChange, passive_param);
-  canvas.addEventListener('touchcancel', onTouchChange, passive_param);
+  handleTouches(canvas);
 
   // For iOS, this is needed in test_fullscreen, but not here, for some reason
   //window.addEventListener('gesturestart', ignored, false);
@@ -741,7 +755,7 @@ function gamepadUpdate() {
           if (n <= 1 && pad_to_touch !== undefined) {
             let touch_data = touches[`g${gpd.id}`];
             if (touch_data) {
-              v2scale(temp_delta, pair, engine.this_frame_time);
+              v2scale(temp_delta, pair, engine.frame_dt);
               v2add(touch_data.delta, touch_data.delta, temp_delta);
               touch_data.total += abs(temp_delta[0]) + abs(temp_delta[1]);
               setMouseToMid();
@@ -834,13 +848,14 @@ export function endFrame(skip_mouse) {
       } else {
         touch_data.delta[0] = touch_data.delta[1] = 0;
         touch_data.dispatched = false;
+        touch_data.dispatched_drag = false;
         touch_data.dispatched_drag_over = false;
         touch_data.up_edge = 0;
         touch_data.down_edge = 0;
         touch_data.down_time = 0;
       }
     }
-    mouse_wheel = 0;
+    wheel_events.length = 0;
     input_eaten_mouse = false;
   }
   input_eaten_kb = false;
@@ -872,12 +887,6 @@ export function mouseMoved() {
   return mouse_moved;
 }
 
-export function mouseWheel() {
-  let ret = mouse_wheel;
-  mouse_wheel = 0;
-  return ret;
-}
-
 function mousePosParam(param) {
   param = param || {};
   return {
@@ -891,9 +900,31 @@ function mousePosParam(param) {
 
 let check_pos = vec2();
 function checkPos(pos, param) {
-  camera2d.domToVirtual(check_pos, pos);
+  if (!camera2d.domToVirtual(check_pos, pos)) {
+    return false;
+  }
   return check_pos[0] >= param.x && (param.w === Infinity || check_pos[0] < param.x + param.w) &&
     check_pos[1] >= param.y && (param.h === Infinity || check_pos[1] < param.y + param.h);
+}
+
+export function mouseWheel(param) {
+  if (input_eaten_mouse || !wheel_events.length) {
+    return 0;
+  }
+  param = param || {};
+  let pos_param = mousePosParam(param);
+  let ret = 0;
+  for (let ii = 0; ii < wheel_events.length; ++ii) {
+    let data = wheel_events[ii];
+    if (data.dispatched) {
+      continue;
+    }
+    if (checkPos(data.pos, pos_param)) {
+      ret += data.delta;
+      data.dispatched = true;
+    }
+  }
+  return ret;
 }
 
 export function mouseOver(param) {
@@ -926,30 +957,41 @@ export function mouseOver(param) {
   return false;
 }
 
-export function mouseDown(button) {
-  if (button === ANY) {
-    return mouseDown(0) || mouseDown(2);
+export function mouseDown(param) {
+  if (input_eaten_mouse) {
+    return null;
   }
-  button = button || 0;
-  return !input_eaten_mouse && mouse_down[button];
+  param = param || {};
+  let pos_param = mousePosParam(param);
+  let button = pos_param.button;
+  // *maybe* should default to Infinite, but for now, defaulting to the same as mouseUpEdge()
+  let max_click_dist = param.max_dist || 50; // TODO: relative to camera distance?
+
+  for (let touch_id in touches) {
+    let touch_data = touches[touch_id];
+    if (touch_data.state !== DOWN ||
+      !(button === ANY || button === touch_data.button) ||
+      touch_data.total > max_click_dist
+    ) {
+      continue;
+    }
+    if (checkPos(touch_data.cur_pos, pos_param)) {
+      // if (!param.peek) {
+      //   touch_data.up_edge = 0;
+      // }
+      return {
+        button: touch_data.button,
+        pos: check_pos.slice(0),
+        start_time: touch_data.start_time,
+      };
+    }
+  }
+
+  return null;
 }
 
 export function mousePosIsTouch() {
   return mouse_pos_is_touch;
-}
-
-export function isTouchDown(param) {
-  if (input_eaten_mouse) {
-    return false;
-  }
-  let pos_param = mousePosParam(param);
-  for (let id in touches) {
-    let touch = touches[id];
-    if (checkPos(touch.cur_pos, pos_param)) {
-      return check_pos.slice(0);
-    }
-  }
-  return false;
 }
 
 export function numTouches() {
@@ -1013,21 +1055,21 @@ export function padGetAxes(out, stickindex, padindex) {
 
 function padButtonDownInternal(gpd, ps, padcode) {
   if (ps[padcode]) {
-    return engine.this_frame_time;
+    return engine.frame_dt;
   }
   return 0;
 }
 function padButtonDownEdgeInternal(gpd, ps, padcode) {
   if (ps[padcode] === DOWN_EDGE) {
     ps[padcode] = DOWN;
-    return engine.this_frame_time;
+    return engine.frame_dt;
   }
   return 0;
 }
 function padButtonUpEdgeInternal(gpd, ps, padcode) {
   if (ps[padcode] === UP_EDGE) {
     delete ps[padcode];
-    return engine.this_frame_time;
+    return engine.frame_dt;
   }
   return 0;
 }
@@ -1078,8 +1120,10 @@ export function mouseUpEdge(param) {
 
   for (let touch_id in touches) {
     let touch_data = touches[touch_id];
-    if (!touch_data.up_edge ||
-      !(button === ANY || button === touch_data.button) ||
+    if (!touch_data.up_edge) {
+      continue;
+    }
+    if (!(button === ANY || button === touch_data.button) ||
       touch_data.total > max_click_dist
     ) {
       continue;
@@ -1154,7 +1198,8 @@ export function mouseConsumeClicks(param) {
   let button = pos_param.button;
   for (let touch_id in touches) {
     let touch_data = touches[touch_id];
-    if (!(button === ANY || button === touch_data.button)) {
+    // Skipping those that already dispatched a drag this frame, must have been handled, do not consume it!
+    if (!(button === ANY || button === touch_data.button) || touch_data.dispatched_drag) {
       continue;
     }
     if (checkPos(touch_data.start_pos, pos_param)) {
@@ -1175,7 +1220,7 @@ export function drag(param) {
 
   for (let touch_id in touches) {
     let touch_data = touches[touch_id];
-    if (!(button === ANY || button === touch_data.button) || touch_data.dispatched) {
+    if (!(button === ANY || button === touch_data.button) || touch_data.dispatched_drag) {
       continue;
     }
     if (checkPos(touch_data.start_pos, pos_param)) {
@@ -1185,7 +1230,7 @@ export function drag(param) {
         continue;
       }
       if (!param.peek) {
-        touch_data.dispatched = true;
+        touch_data.dispatched_drag = true;
       }
       let is_down_edge = touch_data.down_edge;
       if (param.eat_clicks) {
@@ -1280,7 +1325,9 @@ export function dragDrop(param) {
     }
     if (checkPos(touch_data.cur_pos, pos_param)) {
       if (!param.peek) {
-        // Maybe touch_data.dispatched_drag_over as well?
+        // don't want the source (possibly called later this frame) to still think it's dragging
+        touch_data.dispatched_drag_over = true;
+        touch_data.dispatched_drag = true;
         touch_data.dispatched = true;
       }
       return { drag_payload: touch_data.drag_payload };
@@ -1297,7 +1344,7 @@ export function dragOver(param) {
   for (let touch_id in touches) {
     let touch_data = touches[touch_id];
     if (!(button === ANY || button === touch_data.button) ||
-      touch_data.dispatched || touch_data.dispatched_drag_over || // Maybe not .dispatched?
+      touch_data.dispatched_drag_over ||
       !touch_data.drag_payload
     ) {
       continue;

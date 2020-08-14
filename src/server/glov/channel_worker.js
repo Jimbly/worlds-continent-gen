@@ -19,6 +19,7 @@ const METADATA_COMMIT_RATELIMIT = 1500;
 
 function throwErr(err) {
   if (err) {
+    console.error(`Throwing error ${err} from`, new Error().stack);
     throw err;
   }
 }
@@ -65,6 +66,15 @@ function anyUndefined(walk) {
     }
   }
   return false;
+}
+
+export function userDataMap(mapping) {
+  let ret = Object.create(null);
+  ret['public.display_name'] = 'ids.display_name';
+  for (let key in mapping) {
+    ret[key] = mapping[key];
+  }
+  return ret;
 }
 
 export class ChannelWorker {
@@ -361,11 +371,12 @@ export class ChannelWorker {
   // data is a { key, value } pair of what has changed
   onApplyChannelData(source, data) {
     if (this.maintain_client_list) {
-      if (source.type === 'user' && data.key === 'public.display_name') {
+      let mapped = this.user_data_map && this.user_data_map[data.key];
+      if (source.type === 'user' && mapped) {
         for (let client_id in this.data.public.clients) {
           let client_ids = this.data.public.clients[client_id].ids;
           if (client_ids && client_ids.user_id === source.id) {
-            this.setChannelData(`public.clients.${client_id}.ids.display_name`, data.value);
+            this.setChannelData(`public.clients.${client_id}.${mapped}`, data.value);
           }
         }
       }
@@ -375,11 +386,17 @@ export class ChannelWorker {
   // data is the channel's entire (public) data sent in response to a subscribe
   onChannelData(source, data) {
     if (this.maintain_client_list) {
-      if (source.type === 'user' && data.public.display_name) {
+      if (source.type === 'user') {
         for (let client_id in this.data.public.clients) {
           let client_ids = this.data.public.clients[client_id].ids;
           if (client_ids && client_ids.user_id === source.id) {
-            this.setChannelData(`public.clients.${client_id}.ids.display_name`, data.public.display_name);
+            for (let key in this.user_data_map) {
+              let value = dot_prop.get(data, key);
+              if (value) {
+                let mapped = this.user_data_map[key];
+                this.setChannelData(`public.clients.${client_id}.${mapped}`, value);
+              }
+            }
           }
         }
       }
@@ -389,11 +406,6 @@ export class ChannelWorker {
   onBroadcast(source, data, resp_func) {
     if (typeof data !== 'object' || typeof data.data !== 'object' || typeof data.msg !== 'string') {
       return resp_func('ERR_INVALID_DATA');
-    }
-    if (source.type === 'client') {
-      if (this.allow_client_broadcast[data.msg] !== true) {
-        return resp_func('ERR_NOT_ALLOWED');
-      }
     }
     if (data.err) { // From a filter
       return resp_func(data.err);
@@ -505,7 +517,7 @@ export class ChannelWorker {
 
       self.channel_server.ds_store_meta.setAsync(self.store_path, incoming_data, function (err) {
         if (err) {
-          throw err;
+          throwErr(err);
         }
         // Delay the next write
         setTimeout(function () {
@@ -703,6 +715,10 @@ export class ChannelWorker {
     console.error(`ChannelWorker(${this.channel_id}) error:`, msg);
   }
 
+  log(msg) {
+    console.log(`${this.channel_id}:`, msg);
+  }
+
   // Default error handler
   handleError(src, data, resp_func) {
     this.onError(`Unhandled error from ${src.type}.${src.id}: ${data}`);
@@ -863,6 +879,6 @@ ChannelWorker.prototype.emit_join_leave_events = false;
 ChannelWorker.prototype.require_login = false;
 ChannelWorker.prototype.auto_destroy = false;
 ChannelWorker.prototype.permissive_client_set = false; // allow clients to set arbitrary data
-ChannelWorker.prototype.allow_client_broadcast = {}; // default: none
 ChannelWorker.prototype.allow_client_direct = {}; // default: none; but use client_handlers to more easily fill this
 ChannelWorker.prototype.no_datastore = false; // always assume datastore usage
+ChannelWorker.prototype.user_data_map = userDataMap({});

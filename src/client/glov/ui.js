@@ -45,8 +45,10 @@ const menu_fade_params_default = {
 };
 
 export function focuslog(...args) {
-  // console.log(`focuslog(${glov_engine.global_frame_index}): `, ...args);
+  // console.log(`focuslog(${glov_engine.frame_index}): `, ...args);
 }
+
+let color_set_shades = vec4(1, 0.8, 0.7, 0.4);
 
 export function makeColorSet(color) {
   let ret = {
@@ -55,10 +57,10 @@ export function makeColorSet(color) {
     down: vec4(),
     disabled: vec4(),
   };
-  v4scale(ret.regular, color, 1);
-  v4scale(ret.rollover, color, 0.8); // because we do not have specific graphics
-  v4scale(ret.down, color, 0.7);
-  v4scale(ret.disabled, color, 0.4);
+  v4scale(ret.regular, color, color_set_shades[0]);
+  v4scale(ret.rollover, color, color_set_shades[1]);
+  v4scale(ret.down, color, color_set_shades[2]);
+  v4scale(ret.disabled, color, color_set_shades[3]);
   for (let field in ret) {
     ret[field][3] = color[3];
   }
@@ -188,6 +190,13 @@ let focused_key_prev2;
 let pad_focus_left;
 let pad_focus_right;
 
+export function colorSetSetShades(rollover, down, disabled) {
+  color_set_shades[1] = rollover;
+  color_set_shades[2] = down;
+  color_set_shades[3] = disabled;
+  color_button = makeColorSet([1,1,1,1]);
+}
+
 export function loadUISprite(name, ws, hs, overrides, only_override) {
   let override = overrides && overrides[name];
   if (override === null) {
@@ -234,6 +243,12 @@ export function startup(param) {
   // loadUISprite('slider_notch', [3], [13], overrides);
   loadUISprite('slider_handle', [9], [13], overrides);
 
+  loadUISprite('scrollbar_bottom', [11], [13], overrides);
+  loadUISprite('scrollbar_trough', [11], [8], overrides);
+  loadUISprite('scrollbar_top', [11], [13], overrides);
+  loadUISprite('scrollbar_handle_grabber', [11], [13], overrides);
+  loadUISprite('scrollbar_handle', [11], [3, 7, 3], overrides);
+
   sprites.white = glov_sprites.create({ url: 'white' });
 
   button_keys = {
@@ -255,7 +270,7 @@ export function getElem(allow_modal, last_elem) {
   if (dom_elems_issued >= dom_elems.length || !last_elem) {
     let elem = document.createElement('div');
     if (glov_engine.DEBUG && !glov_engine.resizing()) {
-      per_frame_dom_alloc[glov_engine.global_frame_index % per_frame_dom_alloc.length] = 1;
+      per_frame_dom_alloc[glov_engine.frame_index % per_frame_dom_alloc.length] = 1;
       let sum = 0;
       for (let ii = 0; ii < per_frame_dom_alloc.length; ++ii) {
         sum += per_frame_dom_alloc[ii];
@@ -420,7 +435,7 @@ export function focusNext(key) {
   focused_key_not = key;
   // Eat input events so a pair of keys (e.g. SDLK_DOWN and SDLK_CONTROLLER_DOWN)
   // don't get consumed by two separate widgets
-  glov_input.eatAllInput();
+  glov_input.eatAllInput(true);
 }
 
 export function focusPrev(key) {
@@ -431,7 +446,7 @@ export function focusPrev(key) {
   } else {
     focusSteal(focused_key_prev2);
   }
-  glov_input.eatAllInput();
+  glov_input.eatAllInput(true);
 }
 
 export function focusCheck(key) {
@@ -520,10 +535,13 @@ export function buttonShared(param) {
   let key_opts = param.in_event_cb ? { in_event_cb: param.in_event_cb } : null;
   button_mouseover = false;
   if (param.disabled) {
-    glov_input.mouseOver(param); // Still eat mouse events
+    if (glov_input.mouseOver(param)) { // Still eat mouse events
+      if (param.disabled_mouseover) {
+        setMouseOver(key, rollover_quiet);
+      }
+    }
     state = 'disabled';
   } else if (param.drag_target && (ret = glov_input.dragDrop(param))) {
-    console.log('dragDrop');
     if (!param.no_touch_mouseover || !glov_input.mousePosIsTouch()) {
       setMouseOver(key, rollover_quiet);
     }
@@ -550,7 +568,7 @@ export function buttonShared(param) {
   } else if (param.drag_target && glov_input.dragOver(param)) {
     // Set this even if param.no_touch_mouse_over is set
     setMouseOver(key, rollover_quiet);
-    state = glov_input.mouseDown() ? 'down' : 'rollover';
+    state = glov_input.mouseDown({ max_dist: Infinity }) ? 'down' : 'rollover';
   } else if (param.drag_over && glov_input.dragOver(param)) {
     // do nothing
   } else if (glov_input.mouseOver(param)) {
@@ -560,7 +578,7 @@ export function buttonShared(param) {
       // do not set mouseover
     } else {
       setMouseOver(key, rollover_quiet);
-      state = glov_input.mouseDown() ? 'down' : 'rollover';
+      state = glov_input.mouseDown(param) ? 'down' : 'rollover';
     }
   }
   button_focused = focused;
@@ -1019,7 +1037,7 @@ export function tickUI(dt) {
   focused_key_not = null;
   modal_stealing_focus = false;
   touch_changed_focus = false;
-  per_frame_dom_alloc[glov_engine.global_frame_index % per_frame_dom_alloc.length] = 0;
+  per_frame_dom_alloc[glov_engine.frame_index % per_frame_dom_alloc.length] = 0;
 
   last_frame_edit_boxes = exports.this_frame_edit_boxes;
   exports.this_frame_edit_boxes = [];
@@ -1059,7 +1077,7 @@ export function tickUI(dt) {
 
   if (!glov_engine.is_loading && glov_engine.getFrameDtActual() > 50 && pp_this_frame) {
     pp_bad_frames = (pp_bad_frames || 0) + 1;
-    if (pp_bad_frames >= 3) { // 3 in a row, disable superfluous postprocessing
+    if (pp_bad_frames >= 6) { // 6 in a row, disable superfluous postprocessing
       glov_engine.postprocessingAllow(false);
     }
   } else if (pp_bad_frames) {
@@ -1176,40 +1194,55 @@ function spreadTechParams(spread) {
   return tech_params;
 }
 
-function drawCircleInternal(sprite, x, y, z, r, spread, tu1, tv1, tu2, tv2, color) {
-  let x0 = x - r * 2 + r * 4 * tu1;
-  let x1 = x - r * 2 + r * 4 * tu2;
-  let y0 = y - r * 2 + r * 4 * tv1;
-  let y1 = y - r * 2 + r * 4 * tv2;
+function drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color) {
   glov_sprites.queueraw(sprite.texs,
     x0, y0, z, x1 - x0, y1 - y0,
-    tu1, tv1, tu2, tv2,
+    tu0, tv0, tu1, tv1,
     color, glov_font.font_shaders.font_aa, spreadTechParams(spread));
+}
+
+function drawCircleInternal(sprite, x, y, z, r, spread, tu0, tv0, tu1, tv1, color) {
+  let x0 = x - r * 2 + r * 4 * tu0;
+  let x1 = x - r * 2 + r * 4 * tu1;
+  let y0 = y - r * 2 + r * 4 * tv0;
+  let y1 = y - r * 2 + r * 4 * tv1;
+  drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color);
+}
+
+function initCircleSprite() {
+  const CIRCLE_SIZE = 32;
+  let data = new Uint8Array(CIRCLE_SIZE*CIRCLE_SIZE);
+  let midp = (CIRCLE_SIZE - 1) / 2;
+  for (let i = 0; i < CIRCLE_SIZE; i++) {
+    for (let j = 0; j < CIRCLE_SIZE; j++) {
+      let d = sqrt((i - midp)*(i - midp) + (j - midp)*(j - midp)) / midp;
+      let v = clamp(1 - d, 0, 1);
+      data[i + j*CIRCLE_SIZE] = v * 255;
+    }
+  }
+  sprites.circle = glov_sprites.create({
+    url: 'circle',
+    width: CIRCLE_SIZE, height: CIRCLE_SIZE,
+    format: textures.format.R8,
+    data,
+    filter_min: gl.LINEAR,
+    filter_max: gl.LINEAR,
+    wrap_s: gl.CLAMP_TO_EDGE,
+    wrap_t: gl.CLAMP_TO_EDGE,
+    origin: vec2(0.5, 0.5),
+  });
+}
+
+export function drawElipse(x0, y0, x1, y1, z, spread, color) {
+  if (!sprites.circle) {
+    initCircleSprite();
+  }
+  drawElipseInternal(sprites.circle, x0, y0, x1, y1, z, spread, 0, 0, 1, 1, color);
 }
 
 export function drawCircle(x, y, z, r, spread, color) {
   if (!sprites.circle) {
-    const CIRCLE_SIZE = 32;
-    let data = new Uint8Array(CIRCLE_SIZE*CIRCLE_SIZE);
-    let midp = (CIRCLE_SIZE - 1) / 2;
-    for (let i = 0; i < CIRCLE_SIZE; i++) {
-      for (let j = 0; j < CIRCLE_SIZE; j++) {
-        let d = sqrt((i - midp)*(i - midp) + (j - midp)*(j - midp)) / midp;
-        let v = clamp(1 - d, 0, 1);
-        data[i + j*CIRCLE_SIZE] = v * 255;
-      }
-    }
-    sprites.circle = glov_sprites.create({
-      url: 'circle',
-      width: CIRCLE_SIZE, height: CIRCLE_SIZE,
-      format: textures.format.R8,
-      data,
-      filter_min: gl.LINEAR,
-      filter_max: gl.LINEAR,
-      wrap_s: gl.CLAMP_TO_EDGE,
-      wrap_t: gl.CLAMP_TO_EDGE,
-      origin: vec2(0.5, 0.5),
-    });
+    initCircleSprite();
   }
   drawCircleInternal(sprites.circle, x, y, z, r, spread, 0, 0, 1, 1, color);
 }
@@ -1352,6 +1385,10 @@ export function scaleSizes(scale) {
   tooltip_pad = round(8 * scale);
   panel_pixel_scale = button_height / 13; // button_height / panel pixel resolution
   tooltip_panel_pixel_scale = panel_pixel_scale;
+}
+
+export function setPanelPixelScale(scale) {
+  tooltip_panel_pixel_scale = panel_pixel_scale = scale;
 }
 
 export function setModalSizes(_modal_button_width, width, y0, title_scale, pad) {

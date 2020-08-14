@@ -5,6 +5,7 @@ const engine = require('./engine.js');
 const camera2d = require('./camera2d.js');
 const in_event = require('./in_event.js');
 const input = require('./input.js');
+const { abs } = Math;
 const ui = require('./ui.js');
 
 let state_cache = {};
@@ -23,7 +24,7 @@ export function link(param) {
     state = state_cache[key] = { clicked: false };
   }
   let elem = ui.getElem(allow_modal, state.elem);
-  state.frame = engine.global_frame_index;
+  state.frame = engine.frame_index;
   if (elem !== state.elem) {
     state.elem = elem;
     if (elem) {
@@ -37,8 +38,21 @@ export function link(param) {
       a_elem.setAttribute('href', url);
       state.url = url;
       if (internal) {
+        let down_x;
+        let down_y;
+        input.handleTouches(a_elem);
+        a_elem.onmousedown = function (ev) {
+          down_x = ev.pageX;
+          down_y = ev.pageY;
+        };
         a_elem.onclick = function (ev) {
           ev.preventDefault();
+          if (down_x) {
+            let dist = abs(ev.pageX - down_x) + abs(ev.pageY - down_y);
+            if (dist > 50) {
+              return;
+            }
+          }
           state.clicked = true;
           in_event.handle('mouseup', ev);
         };
@@ -86,7 +100,7 @@ export function linkText(param) {
 export function linkTick() {
   for (let key in state_cache) {
     let state = state_cache[key];
-    if (state.frame !== engine.global_frame_index - 1) {
+    if (state.frame !== engine.frame_index - 1) {
       delete state_cache[key];
     }
   }

@@ -1,6 +1,5 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
-/* eslint callback-return:off */
 
 export const FADE_DEFAULT = 0;
 export const FADE_OUT = 1;
@@ -31,7 +30,7 @@ const default_params = {
 let sound_params;
 
 let last_played = {};
-let global_timer = 0;
+let frame_timestamp = 0;
 let fades = [];
 let music;
 
@@ -189,7 +188,7 @@ export function soundResumed() {
 }
 
 export function soundTick(dt) {
-  global_timer += dt;
+  frame_timestamp += dt;
   if (!soundResumed()) {
     return;
   }
@@ -259,13 +258,13 @@ export function soundPlay(soundname, volume, as_music) {
     return null;
   }
   let last_played_time = last_played[soundname] || -9e9;
-  if (global_timer - last_played_time < 45) {
+  if (frame_timestamp - last_played_time < 45) {
     return null;
   }
 
   let id = sound.play(undefined, volume * settings.volume);
   // sound.volume(volume * settings.volume, id);
-  last_played[soundname] = global_timer;
+  last_played[soundname] = frame_timestamp;
   return {
     stop: sound.stop.bind(sound, id),
     playing: sound.playing.bind(sound, id), // not reliable if it hasn't started yet? :(

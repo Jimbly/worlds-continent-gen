@@ -67,9 +67,19 @@ NetPositionManager.prototype.onChannelSubscribe = function (data) {
 
 NetPositionManager.prototype.onChannelData = function (data, mod_key, mod_value) {
   if (mod_key) {
-    let m = mod_key.match(/^public\.clients\.([^.]+)\.pos$/);
+    let m = mod_key.match(/^public\.clients\.([^.]+)\.(.+)$/);
     if (m) {
-      this.otherClientPosChanged(m[1]);
+      let client_id = m[1];
+      let field = m[2];
+      if (field === 'pos') {
+        this.otherClientPosChanged(client_id);
+      }
+      if (this.on_client_change) {
+        let pcd = this.per_client_data[client_id];
+        if (pcd) {
+          this.on_client_change(pcd, field);
+        }
+      }
     }
     if (!mod_value) {
       m = mod_key.match(/^public\.clients\.([^.]+)$/);
@@ -183,6 +193,8 @@ NetPositionManager.prototype.reinit = function (options) {
     send_time: 0,
   };
   this.ever_received_character = false;
+
+  this.on_client_change = options.on_client_change;
 
   if (this.channel) {
     this.channel.on('channel_data', this.on_channel_data);
@@ -304,6 +316,10 @@ NetPositionManager.prototype.getPos = function (client_id) {
   return pcd.pos;
 };
 
+NetPositionManager.prototype.getPCD = function (client_id) {
+  return this.per_client_data[client_id];
+};
+
 NetPositionManager.prototype.otherClientPosChanged = function (client_id) {
   const client_pos = this.channel.getChannelData(`public.clients.${client_id}.pos`);
   if (!client_pos || !client_pos.cur || typeof client_pos.cur[0] !== 'number') {
@@ -383,7 +399,8 @@ NetPositionManager.prototype.updateOtherClient = function (client_id, dt) {
         // made it or passed it
         pcd.pos[ii] = pcd.net_pos[ii];
         pcd.impulse[ii] = 0;
-      } else {
+      } else if (ii < this.dim_pos && pcd.impulse[ii] > 0.01) {
+        // If positional (not rotation), we're not stopped
         stopped = false;
       }
     }
@@ -392,7 +409,7 @@ NetPositionManager.prototype.updateOtherClient = function (client_id, dt) {
     this.on_pos_update(client_id, pcd.pos);
   }
 
-  const cur_is_run = pcd.anim_state[0] === 'w';
+  const cur_is_run = pcd.anim_state[0] === 'f' || pcd.anim_state[0] === 'w';
   const new_is_idle = pcd.net_state[0] === 'i';
   if (cur_is_run && new_is_idle && !stopped) {
     // don't apply yet
