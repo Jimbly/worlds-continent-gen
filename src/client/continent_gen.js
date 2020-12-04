@@ -151,7 +151,9 @@ let relev;
 let rstrahler;
 let water_level;
 let coast_distance;
+let river_distance;
 let ocean_distance;
+let nearest_slope;
 let humidity;
 let classif;
 let blur_temp1;
@@ -179,7 +181,9 @@ function setupWorkBuffers(hex_tex_size) {
   rstrahler = new Uint8Array(total_size);
   water_level = new Uint16Array(total_size);
   coast_distance = new Uint8Array(total_size);
+  river_distance = new Uint8Array(total_size);
   ocean_distance = new Uint8Array(total_size);
+  nearest_slope = new Uint8Array(total_size);
   humidity = new Uint8Array(total_size);
   classif = new Uint8Array(total_size);
   blur_temp1 = new Uint32Array(total_size);
@@ -1082,6 +1086,7 @@ function generateOceanDistanceField() {
     let next = [];
     for (let ii = 0; ii < todo.length; ++ii) {
       let pos = todo[ii];
+      nearest_slope[ii] = tslope[ii];
       let neighbors = neighbors_bit[pos & 1];
       for (let jj = 0; jj < neighbors.length; ++jj) {
         let npos = pos + neighbors[jj];
@@ -1091,6 +1096,9 @@ function generateOceanDistanceField() {
           if (fill[npos] !== D_BORDER) {
             next.push(npos);
           }
+        }
+        if (d === ocean_distance[npos] && tslope[npos] > nearest_slope[ii]) {
+          nearest_slope[ii] = tslope[npos];
         }
       }
     }
@@ -1381,6 +1389,45 @@ function generateCoastDistanceField() {
   }
   coast_distance[0] = min(coast_distance[1] + 1, 255);
   coast_distance[total_size - 1] = min(coast_distance[total_size - 2] + 1, 255);
+}
+
+function generateRiverDistanceField() {
+
+  util.fill(0);
+  let todo = [];
+  let d = 0;
+  for (let ii = 0; ii < river.length; ++ii) {
+    if (river[ii]) {
+      todo.push(ii);
+    }
+  }
+  for (let ii = 0; ii < todo.length; ++ii) {
+    let pos = todo[ii];
+    river_distance[pos] = d;
+    util[pos] = 1;
+  }
+
+  while (todo.length) {
+    d = min(d + 1, 255);
+    let next = [];
+    for (let ii = 0; ii < todo.length; ++ii) {
+      let pos = todo[ii];
+      let neighbors = neighbors_bit[pos & 1];
+      for (let jj = 0; jj < neighbors.length; ++jj) {
+        let npos = pos + neighbors[jj];
+        if (!util[npos]) {
+          util[npos] = 1;
+          river_distance[npos] = d;
+          if (fill[npos] !== D_BORDER) {
+            next.push(npos);
+          }
+        }
+      }
+    }
+    todo = next;
+  }
+  river_distance[0] = min(river_distance[1] + 1, 255);
+  river_distance[total_size - 1] = min(river_distance[total_size - 2] + 1, 255);
 }
 
 function mountainify() {
@@ -1772,7 +1819,9 @@ export function continentGen(param) {
   generateTerrainSlope();
   generateRiverSlope();
   growRivers();
+  pruneFloodedRivers();
   generateOceanDistanceField();
+  generateRiverDistanceField();
   generateOcean();
   generateOutputElevation();
   fixupCoastalWaters();
