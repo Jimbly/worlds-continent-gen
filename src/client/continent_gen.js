@@ -5,7 +5,7 @@
 const assert = require('assert');
 const { abs, atan2, ceil, cos, max, min, floor, round, pow, sin, sqrt, PI } = Math;
 const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS, SKEW_X,
-  C_RIVER_MOUTH,C_SHALLOWS } = require('./proc_gen_constants.js');
+  C_RIVER_DELTA,C_SHALLOWS } = require('./proc_gen_constants.js');
 const { randCreate } = require('./glov/rand_alea.js');
 const SimplexNoise = require('simplex-noise');
 const { clamp, lerp, ridx } = require('../common/util.js');
@@ -1844,7 +1844,7 @@ function determineClassification() {
         if (shallows[pos]) {
           c = C_SHALLOWS;
         } else if (river_mouth_distance[pos] < nearest_strahler[pos]) {
-          c = C_RIVER_MOUTH;
+          c = C_RIVER_DELTA;
         } else {
           c = C_WATER;
         }
