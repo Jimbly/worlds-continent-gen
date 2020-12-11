@@ -7,3 +7,5 @@ export const C_WATER = 0;
 export const C_PLAINS = 1;
 export const C_HILLS = 2;
 export const C_MOUNTAINS = 3;
+export const C_SHALLOWS = 4;
+export const C_RIVER_MOUTH = 5;
