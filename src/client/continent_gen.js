@@ -5,7 +5,7 @@
 const assert = require('assert');
 const { abs, atan2, ceil, cos, max, min, floor, round, pow, sin, sqrt, PI } = Math;
 const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS, SKEW_X,
-  C_RIVER_DELTA,C_SHALLOWS } = require('./proc_gen_constants.js');
+  C_RIVER_DELTA } = require('./proc_gen_constants.js');
 const { randCreate } = require('./glov/rand_alea.js');
 const SimplexNoise = require('simplex-noise');
 const { clamp, lerp, ridx } = require('../common/util.js');
@@ -138,8 +138,8 @@ export const default_opts = {
     cut2: 0.666,
     blur_scale: 680,
     blur_w: 10,
-    show_rivers: true, // debug display option, not used by generator
     show_relief: true, // debug display option, not used by generator
+    show_rivers: false, // debug display option, not used by generator
   },
   output: {
     sea_range_exp: 13,
@@ -1841,9 +1841,7 @@ function determineClassification() {
     for (let pos = 0; pos < total_size; ++pos) {
       let c;
       if (!land[pos]) {
-        if (shallows[pos]) {
-          c = C_SHALLOWS;
-        } else if (river_mouth_distance[pos] < nearest_strahler[pos]) {
+        if (river_mouth_distance[pos] === 0) {
           c = C_RIVER_DELTA;
         } else {
           c = C_WATER;
