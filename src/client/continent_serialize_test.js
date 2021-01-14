@@ -10,6 +10,7 @@ const { ridx } = require('../common/util.js');
 const {
   encodeRLEZeroes,
   encodeRLEU2,
+  encodeRLEU3,
   encodeRLEDict,
   encodeDeltaPakInt,
 } = require('./continent_serialize.js');
@@ -288,6 +289,7 @@ export function continentSerializeTest(cdata) {
       test('RLEU6', encodeRLEUx.bind(null, 6));
     }
     if (field === 'classif') {
+      test('RLEU3', encodeWrap(encodeRLEU3));
       test('RLEUx(2)', encodeRLEUx.bind(null, 2));
       test('RLEU2', encodeWrap(encodeRLEU2));
     }

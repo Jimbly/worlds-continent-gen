@@ -106,6 +106,26 @@ export function encodeRLEU2(pak, data) {
   writecv();
 }
 
+export function encodeRLEU3(pak, data) {
+  let v = data[0];
+  let size = data.length;
+  let c = 0;
+  function writecv() {
+    let out = (v << 5) | c;
+    pak.writeU8(out);
+  }
+  for (let ii = 1; ii < size; ++ii) {
+    if (data[ii] !== v || c === 31) {
+      writecv();
+      c = 0;
+      v = data[ii];
+    } else {
+      c++;
+    }
+  }
+  writecv();
+}
+
 function decodeRLEU2(data, pak) {
   let idx = 0;
   while (idx < data.length) {
