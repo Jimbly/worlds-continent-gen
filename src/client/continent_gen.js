@@ -138,8 +138,8 @@ export const default_opts = {
     cut2: 0.666,
     blur_scale: 680,
     blur_w: 10,
+    show_rivers: true, // debug display option, not used by generator
     show_relief: true, // debug display option, not used by generator
-    show_rivers: false, // debug display option, not used by generator
   },
   output: {
     sea_range_exp: 13,
