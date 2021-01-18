@@ -4,15 +4,13 @@ const assert = require('assert');
 const { abs } = Math;
 const { randCreate } = require('./glov/rand_alea.js');
 
-const C_WATER = 0;
-const C_PLAINS = 1;
-const C_HILLS = 2;
-const C_MOUNTAINS = 3;
+const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS, C_RIVER_DELTA } = require('./proc_gen_constants.js');
 
 function rgb(r,g,b) {
   return new Uint8Array([r, g, b, 255]);
 }
 const OCEAN = rgb(0, 0, 255);
+const RIVER_DELTA = rgb(255, 0, 255);
 const TUNDRA = rgb(224,244,255);
 const MOUNTAINS = rgb(170,170,170);
 const CLIFFS = rgb(90,90,90);
@@ -69,6 +67,9 @@ const choice_elev0_hum25 = weightedChoiceBuild([
 function getBiomeV2(classif, tot_slope, elev, humidity, choice, cdist) {
   if (classif === C_WATER) {
     return OCEAN;
+  }
+  if (classif === C_RIVER_DELTA) {
+    return RIVER_DELTA;
   }
   tot_slope *= 4;
   let is_cliff = tot_slope > 0.6;
