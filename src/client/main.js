@@ -26,7 +26,7 @@ const input = require('./glov/input.js');
 const { linkText } = require('./glov/link.js');
 const { min, floor, round, sqrt } = Math;
 const net = require('./glov/net.js');
-const { C_WATER, C_PLAINS, C_MOUNTAINS } = require('./proc_gen_constants.js');
+const { C_WATER,C_RIVER_DELTA, C_PLAINS, C_MOUNTAINS } = require('./proc_gen_constants.js');
 const shaders = require('./glov/shaders.js');
 const sprites = require('./glov/sprites.js');
 const textures = require('./glov/textures.js');
@@ -246,6 +246,8 @@ export function main() {
           if (c === C_WATER) {
             v3lerp(color, seaColor(pos), MAP_WATER_C0, MAP_WATER_C1);
             v = 0.85 + v * 0.15;
+          } else if (c === C_RIVER_DELTA) {
+            v3set(color, 1, 0, 0);
           } else if (elev2 - opts.output.sea_range > SNOW_ELEVATION) {
             v3set(color, 1, 1, 1);
           } else if (c === C_MOUNTAINS) {

@@ -1846,7 +1846,7 @@ function determineClassification() {
     for (let pos = 0; pos < total_size; ++pos) {
       let c;
       if (!land[pos]) {
-        if (river_mouth_distance[pos] === 0 && rstrahler[pos] > 1) {
+        if (river_mouth_distance[pos] === 0 && nearest_strahler[pos] > 1) {
           c = C_RIVER_DELTA;
         } else {
           c = C_WATER;
