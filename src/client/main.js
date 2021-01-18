@@ -130,7 +130,7 @@ export function main() {
     let view_mode = modes.view;
     let {
       land, fill, tslope, rslope, river, elev, water_level,
-      rstrahler, humidity, classif, time,
+      rstrahler, humidity, classif, time,shallows,trenches,
     } = cdata;
     let width = hex_tex_size;
     let height = width;
@@ -139,13 +139,18 @@ export function main() {
       return elev[pos] / (water_level[pos] || opts.output.sea_range);
     }
 
-    function setColorBuffer(buf, scale, do_ocean) {
+    function setColorBuffer(buf, scale, shallows_buf) {
       for (let ii = 0; ii < tex_total_size; ++ii) {
         if (land[ii]) {
           let v = clamp(buf[ii] * scale, 0, 255);
           tex_data_color[ii * 4] = v;
           tex_data_color[ii * 4 + 1] = v;
           tex_data_color[ii * 4 + 2] = v;
+        } else if (shallows_buf) {
+          let v = clamp(buf[ii] * scale, 0, 255);
+          tex_data_color[ii * 4] = shallows_buf[ii] ? 0 : v;
+          tex_data_color[ii * 4 + 1] = shallows_buf[ii] ? 0 : v;
+          tex_data_color[ii * 4 + 2] = shallows_buf[ii] ? 255 : v;
         } else {
           tex_data_color[ii * 4] = 0;
           tex_data_color[ii * 4 + 1] = 0;
@@ -260,6 +265,9 @@ export function main() {
       if (opts.classif.show_rivers) {
         view_mode = 3;
       }
+    }
+    if (view_mode === 7) {
+      setColorBuffer(trenches, 50,shallows);
     }
 
     // interleave data
@@ -564,6 +572,11 @@ export function main() {
     modeButton('view', 'humid', 4);
     modeButton('view', 'classif', 6);
     modeButton('view', 'biomes', 5);
+    if (num_rows === 1) {
+      y += button_spacing;
+      x = x0 + 25;
+    }
+    modeButton('view', 'tre_sha', 7);
     y += button_spacing;
     x = x0;
     ui.print(style_labels, x, y + 2, Z.UI, 'Edit:');
@@ -591,6 +604,7 @@ export function main() {
     }
     modeButton('edit', 'ocean', 5);
     modeButton('edit', 'classif', 10);
+    modeButton('edit', 'tre_sha', 11);
     modeButton('edit', 'output', 6);
     y += button_spacing;
     x = x0;
@@ -736,6 +750,14 @@ export function main() {
       slider('blur_scale', 0, 1000, 0);
       toggle('show_rivers');
       toggle('show_relief');
+    } else if (modes.edit === 11) {
+      subopts = opts.ocean_trenches;
+      slider('cutoff', 0.1, 1.0, 1, true);
+      slider('frequency', 0.1, 10, 1, true);
+      slider('persistence', 0.01, 2, 2, true);
+      slider('lacunarity', 0.1, 10.0, 2, true);
+      slider('octaves', 1, 10, 0);
+      slider('domain_warp', 0, 2, 0);
     }
   }
 

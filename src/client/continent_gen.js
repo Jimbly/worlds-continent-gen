@@ -90,6 +90,7 @@ export const default_opts = {
     warp_amp: 1,
   },
   ocean_trenches: {
+    cutoff: 0.8,
     frequency: 4,
     amplitude: 1,
     persistence: 0.5,
@@ -166,6 +167,7 @@ let river_mouth_distance;
 let ocean_distance;
 let nearest_strahler;
 let shallows;
+let trenches;
 let humidity;
 let classif;
 let blur_temp1;
@@ -197,6 +199,7 @@ function setupWorkBuffers(hex_tex_size) {
   ocean_distance = new Uint8Array(total_size);
   nearest_strahler = new Uint8Array(total_size);
   shallows = new Uint8Array(total_size);
+  trenches = new Uint8Array(total_size);
   humidity = new Uint8Array(total_size);
   classif = new Uint8Array(total_size);
   blur_temp1 = new Uint32Array(total_size);
@@ -1126,7 +1129,7 @@ function generateOceanTrenches(ii,jj) {
   initNoise(opts.ocean_trenches);
   hexPosToUnifPos(ii, jj);
   let noise_v = sample();
-  let val = step(noise_v,0.8);
+  let val = step(noise_v,opts.ocean_trenches.cutoff);
 
   if (val) {
     hexPosToUnifPos(ii*0.5, jj*0.5);
@@ -1151,6 +1154,7 @@ function generateOcean() {
   let { border_min_dist } = state;
   initNoise(opts.ocean);
   shallows.fill(0);
+  trenches.fill(0);
   for (let jj = 0; jj < height; ++jj) {
     for (let ii = 0; ii < width; ++ii) {
       let pos = jj * width + ii;
@@ -1167,7 +1171,8 @@ function generateOcean() {
           relev[pos] = (river_mouth_distance[pos] * river_mouth_distance[pos]);
         } else { //no delta - normal mode
           distance = fill[pos] === D_BORDER ? 1 : distance;
-          relev[pos] = clamp(distance * 70 + generateOceanTrenches(jj,ii), 0, 255);
+          trenches[pos] = generateOceanTrenches(jj,ii);
+          relev[pos] = clamp(distance * 70 + trenches[pos], 0, 255);
           if (distance < 0.05) {
             shallows[pos] = generateShallows(ii,jj);
           }
@@ -1922,6 +1927,8 @@ export function continentGen(param) {
     ret.rstrahler = rstrahler;
     ret.humidity = humidity;
     ret.classif = classif;
+    ret.trenches = trenches;
+    ret.shallows = shallows;
     ret.coast_distance = coast_distance;
     ret.ocean_distance = ocean_distance;
     ret.debug_priority = debug_priority;
