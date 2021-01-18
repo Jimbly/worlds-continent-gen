@@ -1292,6 +1292,8 @@ function fillLakes() { // Happens much later than generateLakes - after river gr
     let good_elevations = [];
     function addPos(pos) {
       filled.push(pos);
+      // remove strahler so river_deltas dont get placed in middle of lakes.
+      nearest_strahler[pos] = 0;
       let neighbors = neighbors_bit[pos & 1];
       for (let jj = 0; jj < neighbors.length; ++jj) {
         let nidx = pos + neighbors[jj];
