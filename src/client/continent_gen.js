@@ -1907,7 +1907,7 @@ export function continentGen(param) {
   fillLakes();
   pruneFloodedRivers();
   generateCoastDistanceField(); // includes lakes
-  generateRiverMouthDistanceField();
+  generateRiverMouthDistanceField(); //include lakes, calc needed earlier for ocean depth.
   mountainify();
   pruneUphillRivers();
   if (opts.early_out !== 'river') {
