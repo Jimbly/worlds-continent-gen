@@ -123,15 +123,15 @@ export const default_opts = {
     cdist_ramp: 2,
   },
   humidity: {
-    frequency: 2.2,
+    frequency: 3.1,
     amplitude: 1,
-    persistence: 0.5,
+    persistence: 0.4,
     lacunarity: 4,
     octaves: 3,
-    domain_warp: 0,
-    warp_freq: 1,
-    warp_amp: 1,
-    rainshadow: 0.75,
+    domain_warp: 1,
+    warp_freq: 0.7,
+    warp_amp: 2,
+    rainshadow: 0.5,
     show_relief: false, // debug display option, makes extreme rainshadow
   },
   classif: {
