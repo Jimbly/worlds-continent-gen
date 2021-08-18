@@ -2,10 +2,10 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 
 const { filewatchStartup } = require('./filewatch.js');
-const packet = require('../../common/packet.js');
+const packet = require('glov/packet.js');
 const subscription_manager = require('./subscription_manager.js');
 const WSClient = require('./wsclient.js').WSClient;
-const wscommon = require('../../common/wscommon.js');
+const wscommon = require('glov/wscommon.js');
 
 let client;
 let subs;
@@ -22,6 +22,8 @@ export function init(params) {
   client = new WSClient(params.path);
   subs = subscription_manager.create(client, params.cmd_parse);
   subs.auto_create_user = Boolean(params.auto_create_user);
+  subs.no_auto_login = Boolean(params.no_auto_login);
+  subs.allow_anon = Boolean(params.allow_anon);
   window.subs = subs; // for debugging
   exports.subs = subs;
   exports.client = client;
@@ -29,6 +31,7 @@ export function init(params) {
 
   if (params.engine) {
     params.engine.addTickFunc((dt) => {
+      client.checkDisconnect();
       subs.tick(dt);
     });
   }
@@ -37,7 +40,7 @@ export function init(params) {
 const build_timestamp_string = new Date(Number(BUILD_TIMESTAMP))
   .toISOString()
   .replace('T', ' ')
-  .slice(0, -8);
+  .slice(5, -8);
 export function buildString() {
   return build_timestamp_string;
 }

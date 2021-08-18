@@ -4,7 +4,7 @@
 const assert = require('assert');
 const { isInteger } = require('./util.js');
 
-function canonical(cmd) {
+export function canonical(cmd) {
   return cmd.toLowerCase().replace(/[_.]/g, '');
 }
 
@@ -97,6 +97,7 @@ CmdParse.prototype.handle = function (self, str, resp_func) {
   if (!cmd_data) {
     this.was_not_found = true;
     resp_func(`Unknown command: "${m[1]}"`);
+    this.was_not_found = false;
     return false;
   }
   cmd_data.fn.call(self, m[2] || '', resp_func);
@@ -107,6 +108,9 @@ CmdParse.prototype.register = function (param) {
   assert.equal(typeof param, 'object');
   let { cmd, func, help, usage, access_show, access_run } = param;
   assert(cmd && func);
+  if (usage && help) {
+    usage = usage.replace(/\$HELP/, help);
+  }
   this.cmds[canonical(cmd)] = {
     name: cmd,
     fn: func,
@@ -130,7 +134,19 @@ CmdParse.prototype.registerValue = function (cmd, param) {
     assert(param.set);
     let init_value = this.storage.getJSON(store_key);
     if (init_value !== undefined) {
-      param.set(init_value);
+      // enforce stored values within current range
+      if (param.range) {
+        init_value = Number(init_value);
+        if (!isFinite(init_value) || init_value < param.range[0] || init_value > param.range[1]) {
+          init_value = undefined;
+        }
+      }
+      if (init_value !== undefined) {
+        param.set(init_value);
+        if (param.on_change) {
+          param.on_change();
+        }
+      }
     }
   }
   let fn = (str, resp_func) => {
@@ -175,6 +191,9 @@ CmdParse.prototype.registerValue = function (cmd, param) {
     }
     if (store) {
       this.storage.setJSON(store_key, store_value);
+    }
+    if (param.on_change) {
+      param.on_change();
     }
     if (param.get) {
       return value();

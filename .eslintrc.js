@@ -22,7 +22,7 @@ module.exports = {
   },
   "extends": "eslint:recommended",
   "parserOptions": {
-    "ecmaVersion": 2018,
+    "ecmaVersion": 2020,
     "sourceType": "module"
   },
   "rules": {
@@ -135,7 +135,8 @@ module.exports = {
         },
         "MemberExpression": "off",
         "ObjectExpression": 1, // "first",
-        "SwitchCase": 1
+        "SwitchCase": 1,
+        "flatTernaryExpressions": true, // JE
       }
     ],
     "indent-legacy": "off",
@@ -434,7 +435,7 @@ module.exports = {
     ],
     "sort-imports": "error",
     "sort-keys": "off",
-    "sort-vars": "error",
+    "sort-vars": "off", // JE
     "space-before-blocks": [
       "error",
       "always"

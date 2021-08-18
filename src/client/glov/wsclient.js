@@ -2,13 +2,14 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 /* global WebSocket, XMLHttpRequest */
 
-const ack = require('../../common/ack.js');
+const ack = require('glov/ack.js');
 const { ackInitReceiver } = ack;
 const assert = require('assert');
+const { errorReportSetDetails, session_uid } = require('./error_report.js');
 const { min } = Math;
 const urlhash = require('./urlhash.js');
 const walltime = require('./walltime.js');
-const wscommon = require('../../common/wscommon.js');
+const wscommon = require('glov/wscommon.js');
 const { wsHandleMessage } = wscommon;
 
 // let net_time = 0;
@@ -20,6 +21,7 @@ const { wsHandleMessage } = wscommon;
 
 export function WSClient(path) {
   this.id = null;
+  this.my_ids = {}; // set of all IDs I've been during this session
   this.handlers = {};
   this.socket = null;
   this.connected = false;
@@ -28,6 +30,7 @@ export function WSClient(path) {
   this.retry_count = 0;
   this.disconnect_time = Date.now();
   this.last_receive_time = Date.now();
+  this.idle_counter = 0;
   this.last_send_time = Date.now();
   this.auto_path = !path;
   ackInitReceiver(this);
@@ -106,6 +109,8 @@ WSClient.prototype.onConnectAck = function (data, resp_func) {
   client.connected = true;
   client.disconnected = false;
   client.id = data.id;
+  client.my_ids[data.id] = true;
+  errorReportSetDetails('client_id', client.id);
   client.secret = data.secret;
   if (data.app_ver) {
     client.onAppVer(data.app_ver);
@@ -114,12 +119,13 @@ WSClient.prototype.onConnectAck = function (data, resp_func) {
   assert(client.handlers.connect);
   client.handlers.connect(client, {
     client_id: client.id,
+    restarting: data.restarting,
   });
   resp_func();
 };
 
 
-WSClient.prototype.wsPak = function (msg) {
+WSClient.prototype.pak = function (msg) {
   return wscommon.wsPak(msg, null, this);
 };
 
@@ -128,6 +134,7 @@ WSClient.prototype.send = function (msg, data, resp_func) {
 };
 
 WSClient.prototype.onError = function (e) {
+  console.error('WSClient Error');
   console.error(e);
   throw e;
 };
@@ -192,12 +199,21 @@ WSClient.prototype.retryConnection = function () {
   }, min(client.retry_count * client.retry_count * 100, 15000));
 };
 
+WSClient.prototype.checkDisconnect = function () {
+  if (this.connected && this.socket.readyState !== 1) { // WebSocket.OPEN
+    // We think we're connected, but we're not, we must have received an
+    // animation frame before the close event when phone was locked or something
+    this.on_close();
+    assert(!this.connected);
+  }
+};
+
 WSClient.prototype.connect = function (for_reconnect) {
   let client = this;
 
   let path = `${(client.retry_count % 2) ? client.path2 : client.path}?pver=${wscommon.PROTOCOL_VERSION}${
     for_reconnect && client.id && client.secret ? `&reconnect=${client.id}&secret=${client.secret}` : ''
-  }`;
+  }&sesuid=${session_uid}`;
   let socket = new WebSocket(path);
   socket.binaryType = 'arraybuffer';
   client.socket = socket;
@@ -218,6 +234,7 @@ WSClient.prototype.connect = function (for_reconnect) {
     if (client.connected) {
       client.disconnect_time = Date.now();
       client.disconnected = true;
+      errorReportSetDetails('disconnected', 1);
     }
     client.connected = false;
     if (!skip_close) {
@@ -264,10 +281,12 @@ WSClient.prototype.connect = function (for_reconnect) {
     client.retry_count = 0;
   }));
 
-  client.socket.addEventListener('close', guard(function () {
+  // This may get called before the close event gets to use
+  client.on_close = guard(function () {
     console.log('WebSocket close, retrying connection...');
     retry(true);
-  }));
+  });
+  client.socket.addEventListener('close', client.on_close);
 
   let doPing = guard(function () {
     if (Date.now() - client.last_send_time > wscommon.PING_TIME && client.connected && client.socket.readyState === 1) {

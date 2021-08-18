@@ -1,32 +1,38 @@
 // Portions Copyright 2020 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 const assert = require('assert');
-const { asyncParallel } = require('../../common/async.js');
+const { asyncParallel } = require('glov-async');
 const camera2d = require('./camera2d.js');
 const { cmd_parse } = require('./cmds.js');
 const engine = require('./engine.js');
 const glov_font = require('./font.js');
+const { isFriend } = require('./friends.js');
 const input = require('./input.js');
 const { link } = require('./link.js');
 const local_storage = require('./local_storage.js');
-const { ceil, floor, max, min } = Math;
+const { ceil, floor, max, min, round } = Math;
 const net = require('./net.js');
 const { profanityFilter, profanityStartup } = require('./words/profanity.js');
 const { scrollAreaCreate } = require('./scroll_area.js');
 const settings = require('./settings.js');
 const ui = require('./ui.js');
-const { clamp, matchAll } = require('../../common/util.js');
-const { vec4, v3copy } = require('./vmath.js');
+const { clamp, matchAll } = require('glov/util.js');
+const { vec4, v3copy } = require('glov/vmath.js');
 
-const FADE_START_TIME = [10000, 1000];
-const FADE_TIME = [1000, 500];
-
-const INDENT = 40;
+const FADE_START_TIME = [10000, 5000];
+const FADE_TIME = [1000, 1000];
 
 const FLAG_EMOTE = 1;
+const FLAG_USERCHAT = 2;
 
 Z.CHAT = Z.CHAT || 500;
 Z.CHAT_FOCUSED = Z.CHAT_FOCUSED || Z.CHAT;
+
+const color_user_rollover = vec4(1,1,1,0.5);
+
+const MAX_PER_STYLE = {
+  join_leave: 3,
+};
 
 settings.register({
   chat_auto_unfocus: {
@@ -47,7 +53,7 @@ settings.register({
 });
 
 function CmdHistory() {
-  assert(local_storage.storage_prefix !== 'demo'); // wrong initialization order
+  assert(local_storage.getStoragePrefix() !== 'demo'); // wrong initialization order
   this.entries = new Array(50);
   this.idx = local_storage.getJSON('console_idx'); // where we will next insert
   if (typeof this.idx !== 'number' || this.idx < 0 || this.idx >= this.entries.length) {
@@ -157,58 +163,61 @@ function ChatUI(params) {
   });
   this.w = params.w || engine.game_width / 2;
   this.h = params.h || engine.game_height / 2; // excluding text entry
+  this.volume_join_leave = params.volume_join_leave || 1;
+  this.volume_in = params.volume_in || 1;
+  this.volume_out = params.volume_out || 1;
   this.history = new CmdHistory();
   this.get_roles = null; // returns object for testing cmd access permissions
   this.url_match = params.url_match; // runs `/url match[1]` if clicked
   this.url_info = params.url_info; // Optional for grabbing the interesting portion of the URL for tooltip and /url
+  this.user_context_cb = params.user_context_cb; // Cb called with { user_id } on click
   this.setActiveSize(this.font_height, this.w);
+  let outline_width = params.outline_width || 1;
 
   this.styles = {
     def: glov_font.style(null, {
       color: 0xEEEEEEff,
-      outline_width: 1.0,
+      outline_width,
       outline_color: 0x000000ff,
     }),
     system: glov_font.style(null, {
       color: 0xAAAAAAff,
-      outline_width: 1.0,
+      outline_width,
       outline_color: 0x000000ff,
     }),
     error: glov_font.style(null, {
       color: 0xDD0000ff,
-      outline_width: 1.0,
+      outline_width,
       outline_color: 0x000000ff,
     }),
     link: glov_font.style(null, {
       color: 0x5040FFff,
-      outline_width: 1.0,
+      outline_width,
       outline_color: 0x000000ff,
     }),
     link_hover: glov_font.style(null, {
       color: 0x0000FFff,
-      outline_width: 1.0,
+      outline_width,
       outline_color: 0x000000ff,
     }),
   };
   this.styles.join_leave = this.styles.system;
 
-  net.subs.on('admin_msg', (msg) => {
-    ui.playUISound('msg_err');
-    this.addChat(msg, 'error');
-  });
+  net.subs.on('chat_broadcast', this.onChatBroadcast.bind(this));
 }
 
 ChatUI.prototype.setActiveSize = function (font_height, w) {
   let wrap_w = w - this.scroll_area.barWidth();
   if (this.active_font_height !== font_height || this.wrap_w !== wrap_w) {
     this.active_font_height = font_height;
+    this.indent = round(this.active_font_height/24 * 40);
     this.wrap_w = wrap_w;
     // recalc numlines
     this.total_lines = 0;
     for (let ii = 0; ii < this.msgs.length; ++ii) {
       let elem = this.msgs[ii];
       elem.numlines = ui.font.numLines(this.styles[elem.style] || this.styles.def,
-        this.wrap_w, INDENT, this.active_font_height, elem.msg);
+        this.wrap_w, this.indent, this.active_font_height, elem.msg_text);
       this.total_lines += elem.numlines;
     }
   }
@@ -219,17 +228,56 @@ ChatUI.prototype.clearChat = function () {
   this.total_lines = 0;
 };
 
+function notHidden(msg) {
+  return !msg.hidden;
+}
+
 ChatUI.prototype.addMsgInternal = function (elem) {
   elem.timestamp = elem.timestamp || Date.now();
+  if (elem.flags & FLAG_USERCHAT) {
+    if (elem.flags & FLAG_EMOTE) {
+      elem.msg_text = `${elem.display_name} ${elem.msg}`;
+    } else {
+      elem.msg_text = `[${elem.display_name}] ${elem.msg}`;
+    }
+  } else {
+    elem.msg_text = elem.msg;
+  }
   elem.numlines = ui.font.numLines(this.styles[elem.style] || this.styles.def,
-    this.wrap_w, INDENT, this.active_font_height, elem.msg);
+    this.wrap_w, this.indent, this.active_font_height, elem.msg_text);
   this.total_lines += elem.numlines;
   this.msgs.push(elem);
+  let max_msgs = MAX_PER_STYLE[elem.style];
+  if (max_msgs) {
+    // Remove any more than max
+    // Also remove any for the same ID (want for 'join_leave', maybe not others?)
+    for (let ii = this.msgs.length - 2; ii >= 0; --ii) {
+      let elem2 = this.msgs[ii];
+      if (elem2.style === elem.style && !elem2.hidden) {
+        if (elem.id && elem2.id === elem.id) {
+          elem2.hidden = true;
+          this.total_lines -= elem2.numlines;
+          elem2.numlines = 0;
+        } else {
+          --max_msgs;
+          if (max_msgs <= 0) {
+            elem2.hidden = true;
+            this.total_lines -= elem2.numlines;
+            elem2.numlines = 0;
+            break;
+          }
+        }
+      }
+    }
+  }
   if (this.msgs.length > this.max_messages * 1.25) {
-    this.msgs.splice(0, this.msgs.length - this.max_messages);
-    this.total_lines = 0;
-    for (let ii = 0; ii < this.msgs.length; ++ii) {
-      this.total_lines += this.msgs[ii].numlines;
+    this.msgs = this.msgs.filter(notHidden);
+    if (this.msgs.length > this.max_messages * 1.25) {
+      this.msgs.splice(0, this.msgs.length - this.max_messages);
+      this.total_lines = 0;
+      for (let ii = 0; ii < this.msgs.length; ++ii) {
+        this.total_lines += this.msgs[ii].numlines;
+      }
     }
   }
 };
@@ -239,7 +287,7 @@ ChatUI.prototype.addChat = function (msg, style) {
   this.addMsgInternal({ msg, style });
 };
 ChatUI.prototype.addChatFiltered = function (data) {
-  console.log(data.msg);
+  console.log(`Chat from ${data.id}: ${data.msg}`);
   if (settings.profanity_filter) {
     data.msg = profanityFilter(data.msg);
   }
@@ -247,36 +295,54 @@ ChatUI.prototype.addChatFiltered = function (data) {
 };
 ChatUI.prototype.onMsgJoin = function (data) {
   if (data.client_id !== net.client.id) {
-    ui.playUISound('user_join');
+    if (this.volume_join_leave) {
+      ui.playUISound('user_join', this.volume_join_leave);
+    }
     this.addChatFiltered({
       id: data.user_id || data.client_id,
-      msg: `${data.display_name || data.client_id} joined the channel`,
+      display_name: data.display_name || data.client_id,
+      flags: FLAG_EMOTE|FLAG_USERCHAT,
+      msg: 'joined the channel',
       style: 'join_leave',
     });
   }
 };
 ChatUI.prototype.onMsgLeave = function (data) {
-  ui.playUISound('user_leave');
+  if (this.volume_join_leave) {
+    ui.playUISound('user_leave', this.volume_join_leave);
+  }
   this.addChatFiltered({
     id: data.user_id || data.client_id,
-    msg: `${data.display_name || data.client_id} left the channel`,
+    display_name: data.display_name || data.client_id,
+    flags: FLAG_EMOTE|FLAG_USERCHAT,
+    msg: 'left the channel',
     style: 'join_leave',
   });
 };
 ChatUI.prototype.onMsgChat = function (data) {
   let { msg, id, client_id, display_name, flags, ts, quiet } = data;
   if (!quiet && client_id !== net.client.id) {
-    ui.playUISound('msg_in');
+    if (this.volume_in) {
+      ui.playUISound('msg_in', this.volume_in);
+    }
   }
-  msg = (flags & FLAG_EMOTE) ?
-    `${display_name || id} ${msg}` :
-    `[${display_name || id}] ${msg}`;
+  display_name = display_name || id;
+  flags = (flags || 0) | FLAG_USERCHAT;
   this.addChatFiltered({
     id,
+    display_name,
     msg,
     flags,
     timestamp: ts,
     quiet,
+  });
+};
+ChatUI.prototype.onChatBroadcast = function (data) {
+  let { msg, src } = data;
+  ui.playUISound('msg_err');
+  this.addChatFiltered({
+    msg: `[${src}] ${msg}`,
+    style: 'error',
   });
 };
 
@@ -293,15 +359,22 @@ ChatUI.prototype.runLate = function () {
   }
 };
 
+function errStr(err) {
+  if (typeof err === 'object') {
+    return JSON.stringify(err);
+  }
+  return err;
+}
+
 ChatUI.prototype.handleCmdParseError = function (err, resp) {
   if (err) {
-    this.addChat(`[error] ${err}`, 'error');
+    this.addChat(`[error] ${errStr(err)}`, 'error');
   }
 };
 
 ChatUI.prototype.handleCmdParse = function (err, resp) {
   if (err) {
-    this.addChat(`[error] ${err}`, 'error');
+    this.addChat(`[error] ${errStr(err)}`, 'error');
   } else if (resp) {
     this.addChat(`[system] ${(typeof resp === 'string') ? resp : JSON.stringify(resp)}`, 'system');
   }
@@ -320,12 +393,12 @@ ChatUI.prototype.getAccessObj = function () {
   return access_dummy;
 };
 
-ChatUI.prototype.cmdParse = function (str, on_error) {
-  let handleResult = on_error ?
+ChatUI.prototype.cmdParse = function (str, cb) {
+  let handleResult = cb ?
     (err, resp) => {
       this.handle_cmd_parse(err, resp);
-      if (on_error && err) {
-        on_error(err);
+      if (cb) {
+        cb(err);
       }
     } :
     this.handle_cmd_parse;
@@ -428,7 +501,7 @@ function drawHelpTooltip(param) {
       let cmd_w = ui.font.drawSized(help_font_style_cmd,
         text_x, y, z+1, h, cmd);
       ui.font.drawSizedAligned(help_font_style,
-        text_x + cmd_w, y, z+1, h, glov_font.ALIGN.HFIT,
+        text_x + cmd_w, y, z+2, h, glov_font.ALIGN.HFIT,
         text_w - cmd_w, 0,
         help);
       let pos = { x, y, w, h };
@@ -467,7 +540,7 @@ ChatUI.prototype.isFocused = function () {
 ChatUI.prototype.sendChat = function (flags, text) {
   if (!net.client.connected) {
     this.addChat('[error] Cannot chat: Disconnected', 'error');
-  } else if (!this.channel || !net.subs.loggedIn()) {
+  } else if (!this.channel || !net.subs.loggedIn() && !net.subs.allow_anon) {
     this.addChat('[error] Cannot chat: Must be logged in', 'error');
   } else if (text.length > this.max_len) {
     this.addChat('[error] Chat message too long', 'error');
@@ -475,9 +548,19 @@ ChatUI.prototype.sendChat = function (flags, text) {
     let pak = this.channel.pak('chat');
     pak.writeInt(flags);
     pak.writeString(text);
-    pak.send((err) => {
+    pak.send((err, data) => {
       if (err) {
-        this.addChat(`[error] ${err}`, 'error');
+        if (err === 'ERR_ECHO') {
+          this.onMsgChat({
+            msg: text,
+            id: net.subs.loggedIn(),
+            client_id: net.client.id,
+            display_name: net.subs.logged_in_display_name,
+            flags,
+          });
+        } else {
+          this.addChat(`[error] ${errStr(err)}`, 'error');
+        }
         // if (!this.edit_text_entry.getText()) {
         //   this.edit_text_entry.setText(text);
         // }
@@ -486,9 +569,12 @@ ChatUI.prototype.sendChat = function (flags, text) {
   }
 };
 
-const SPACE_ABOVE_ENTRY = 8;
 ChatUI.prototype.run = function (opts) {
+  const UI_SCALE = ui.font_height / 24;
   opts = opts || {};
+  const SPACE_ABOVE_ENTRY = opts.border || (8 * UI_SCALE);
+  const border = opts.border || (8 * UI_SCALE);
+  const scroll_grow = opts.scroll_grow || 0;
   if (net.client.disconnected && !this.hide_disconnected_message) {
     ui.font.drawSizedAligned(
       glov_font.style(null, {
@@ -505,10 +591,12 @@ ChatUI.prototype.run = function (opts) {
     this.runLate();
   }
   this.did_run_late = false;
-  let x = camera2d.x0() + 10;
-  let y0 = camera2d.y1();
-  let y = y0;
-  let w = this.w;
+  const x0 = opts.x === undefined ? camera2d.x0() : opts.x;
+  const y0 = opts.y === undefined ? camera2d.y1() - this.h : opts.y;
+  const y1 = y0 + this.h;
+  let x = x0 + border;
+  let y = y1;
+  let outer_w = this.w;
   let was_focused = this.isFocused();
   let z = was_focused ? Z.CHAT_FOCUSED : Z.CHAT;
   let is_focused = false;
@@ -521,7 +609,7 @@ ChatUI.prototype.run = function (opts) {
   let hide_text_input = ui.modal_dialog || ui.menu_up || hide_light;
   if (!hide_text_input && was_focused && input.touch_mode) {
     // expand chat when focused on touch devices
-    w = camera2d.x1() - x - 24;
+    outer_w = camera2d.x1() - x0 - 24 * UI_SCALE;
     let font_scale = 4;
     let aspect = camera2d.screenAspect();
     if (aspect > 2) { // scale up to font scale of 8
@@ -529,13 +617,14 @@ ChatUI.prototype.run = function (opts) {
     }
     font_height *= font_scale;
   }
-  this.setActiveSize(font_height, w); // may recalc numlines on each elem; updates wrap_w
+  const inner_w = outer_w - border;
+  this.setActiveSize(font_height, inner_w); // may recalc numlines on each elem; updates wrap_w
   if (!hide_text_input) {
     anything_visible = true;
-    y -= 16 + font_height;
+    y -= border + font_height + 1;
     if (!was_focused && opts.pointerlock && input.pointerLocked()) {
       // do not show edit box
-      ui.font.drawSizedAligned(this.styles.def, x, y, z + 1, font_height, glov_font.ALIGN.HFIT, w, 0,
+      ui.font.drawSizedAligned(this.styles.def, x, y, z + 1, font_height, glov_font.ALIGN.HFIT, inner_w, 0,
         '<Press Enter to chat>');
     } else {
       if (was_focused) {
@@ -576,7 +665,7 @@ ChatUI.prototype.run = function (opts) {
               let last_msg = this.msgs[this.msgs.length - 1];
               if (last_msg) {
                 let msg = last_msg.msg;
-                if (msg && msg.slice(0, 7) === '[error]') {
+                if (msg && !(msg.flags & FLAG_USERCHAT) && msg.slice(0, 7) === '[error]') {
                   let numlines = last_msg.numlines;
                   tooltip_y -= font_height * numlines + SPACE_ABOVE_ENTRY;
                 }
@@ -584,7 +673,7 @@ ChatUI.prototype.run = function (opts) {
 
               let selected = drawHelpTooltip({
                 x, y: tooltip_y,
-                tooltip_width: max(w, engine.game_width * 0.8),
+                tooltip_width: max(inner_w, engine.game_width * 0.8),
                 tooltip: auto_text,
                 do_selection,
                 font_height: min(font_height, camera2d.w() / 30),
@@ -610,7 +699,7 @@ ChatUI.prototype.run = function (opts) {
         this.scroll_area.keyboardScroll();
       }
       let input_height = font_height;
-      let input_width = w;
+      let input_width = inner_w - (opts.cuddly_scroll ? this.scroll_area.barWidth() + 1 + border : border);
       if (input.touch_mode && !was_focused) {
         y -= font_height * 2;
         input_height = font_height * 3;
@@ -629,10 +718,18 @@ ChatUI.prototype.run = function (opts) {
               text = text.slice(1);
             }
             this.history.add(text);
-            this.cmdParse(text.slice(1), () => {
-              ui.playUISound('msg_out_err');
+            if (net.subs) {
+              net.subs.serverLog('cmd', text);
+            }
+            this.cmdParse(text.slice(1), (err) => {
+              if (!err) {
+                return;
+              }
+              if (this.volume_out) {
+                ui.playUISound('msg_out_err', this.volume_out);
+              }
               if (!this.edit_text_entry.getText()) {
-                this.history.unadd(text);
+                // this.history.unadd(text);
                 this.edit_text_entry.setText(text);
               }
               if (!is_focused) { // was auto-unfocused
@@ -642,7 +739,9 @@ ChatUI.prototype.run = function (opts) {
           } else {
             this.sendChat(0, text);
           }
-          ui.playUISound('msg_out'); // after cmdParse may have adjust volume
+          if (this.volume_out) {
+            ui.playUISound('msg_out', this.volume_out); // after cmdParse may have adjust volume
+          }
           if (settings.chat_auto_unfocus) {
             is_focused = false;
             ui.focusCanvas();
@@ -656,14 +755,19 @@ ChatUI.prototype.run = function (opts) {
   }
   y -= SPACE_ABOVE_ENTRY;
 
-  let { url_match, url_info, styles, wrap_w } = this;
+  let { url_match, url_info, styles, wrap_w, user_context_cb } = this;
   let self = this;
-  let do_scroll_area = is_focused;
+  let do_scroll_area = is_focused || opts.always_scroll;
+  let bracket_width = 0;
+  let name_width = {};
   // Slightly hacky: uses `x` and `y` from the higher scope
   function drawChatLine(msg, alpha) {
-    let line = msg.msg;
+    if (msg.hidden) {
+      return;
+    }
+    let line = msg.msg_text;
     let numlines = msg.numlines;
-    let is_url = url_match && matchAll(line, url_match);
+    let is_url = do_scroll_area && url_match && matchAll(line, url_match);
     is_url = is_url && is_url.length === 1 && is_url[0];
     let url_label = is_url;
     if (is_url && url_info) {
@@ -673,10 +777,6 @@ ChatUI.prototype.run = function (opts) {
       }
     }
     let h = font_height * numlines;
-    let click;
-    if (is_url) {
-      click = link({ x, y, w: wrap_w, h, url: is_url, internal: true });
-    }
     let do_mouseover = do_scroll_area && !input.mousePosIsTouch() && (!msg.style || msg.style === 'def' || is_url);
     let text_w;
     let mouseover = false;
@@ -685,8 +785,50 @@ ChatUI.prototype.run = function (opts) {
       // mouseOver peek because we're doing it before checking for clicks
       mouseover = input.mouseOver({ x, y, w: min(text_w, wrap_w), h, peek: true });
     }
-    let style = styles[msg.style || (is_url ? mouseover ? 'link_hover' : 'link' : 'def')];
-    ui.font.drawSizedWrapped(glov_font.styleAlpha(style, alpha), x, y, z + 1, wrap_w, INDENT, font_height, line);
+    let user_mouseover = false;
+    let user_indent = 0;
+    let did_user_context = false;
+    if ((msg.flags & FLAG_USERCHAT) && user_context_cb && msg.id && do_scroll_area) {
+      let nw = name_width[msg.display_name];
+      if (!nw) {
+        nw = name_width[msg.display_name] = ui.font.getStringWidth(styles.def, font_height, msg.display_name);
+      }
+      if (!(msg.flags & FLAG_EMOTE)) {
+        if (!bracket_width) {
+          bracket_width = ui.font.getStringWidth(styles.def, font_height, '[]');
+        }
+        nw += bracket_width;
+      }
+      user_indent = nw;
+      let pos_param = {
+        x, y, w: min(nw, wrap_w), h: font_height, button: 0, peek: true,
+        z: z + 0.5,
+        color: color_user_rollover,
+      };
+      if (input.click(pos_param)) {
+        did_user_context = true;
+        user_context_cb({
+          user_id: msg.id, // Need any other msg. params?
+          // x: pos_param.x + pos_param.w,
+          // y: pos_param.y,
+        });
+      } else {
+        user_mouseover = input.mouseOver(pos_param);
+        if (user_mouseover) {
+          ui.drawRect2(pos_param);
+        }
+      }
+    }
+    let click;
+    if (is_url) {
+      click = link({ x: x + user_indent, y, w: wrap_w - user_indent, h, url: is_url, internal: true });
+    }
+
+    let style = styles[msg.style || (is_url ? mouseover && !user_mouseover ? 'link_hover' : 'link' : 'def')];
+
+    // Draw the actual text
+    ui.font.drawSizedWrapped(glov_font.styleAlpha(style, alpha), x, y, z + 1, wrap_w, self.indent, font_height, line);
+
     if (mouseover && (!do_scroll_area || y > self.scroll_area.scroll_pos - font_height) &&
       // Only show tooltip for user messages or links
       (!msg.style || msg.style === 'def' || is_url)
@@ -694,17 +836,21 @@ ChatUI.prototype.run = function (opts) {
       ui.drawTooltip({
         x, y, z: Z.TOOLTIP,
         tooltip_above: true,
-        tooltip_width: 450,
-        tooltip_pad: ui.tooltip_pad * 0.5,
-        tooltip: is_url ?
+        tooltip_width: 450 * UI_SCALE,
+        tooltip_pad: round(ui.tooltip_pad * 0.5),
+        tooltip: is_url && !user_mouseover ?
           `Click to open ${url_label}` :
           `Received${msg.id ? ` from "${msg.id}"` : ''} at ${conciseDate(new Date(msg.timestamp))}\n` +
-          'Right-click to copy',
+          'Right-click to copy message' +
+          `${(user_mouseover ? '\nClick to view user info' : '')}`,
         pixel_scale: ui.tooltip_panel_pixel_scale * 0.5,
       });
     }
-    // mouseDownEdge because by the time the Up happens, the chat text might not be here anymore
-    click = click || input.mouseDownEdge({ x, y, w: wrap_w, h });
+    // Previously: mouseDownEdge because by the time the Up happens, the chat text might not be here anymore
+    click = click || input.click({ x, y, w: wrap_w, h });
+    if (did_user_context) {
+      click = null;
+    }
     if (click) {
       if (click.button === 2) {
         ui.provideUserString('Chat Text', is_url ? 'URL' : 'Text', is_url || line);
@@ -716,22 +862,31 @@ ChatUI.prototype.run = function (opts) {
   }
 
 
-  let border = 8;
   let now = Date.now();
   if (do_scroll_area) {
     // within scroll area, just draw visible parts
     let scroll_internal_h = this.total_lines * font_height;
-    let scroll_external_h = min(this.h, scroll_internal_h);
+    if (opts.cuddly_scroll) {
+      let new_y = y1 - border;
+      scroll_internal_h += new_y - y;
+      y = new_y;
+    }
+    scroll_internal_h += scroll_grow;
+    y += scroll_grow;
+    let scroll_y0 = opts.always_scroll ? y0 + border - scroll_grow : y - min(this.h, scroll_internal_h);
+    let scroll_external_h = y - scroll_y0;
+    let clip_offs = 1; // for font outline
     this.scroll_area.begin({
-      x, y: y - scroll_external_h, z,
-      w: w + 8,
+      x: x - clip_offs,
+      y: scroll_y0, z,
+      w: inner_w + clip_offs,
       h: scroll_external_h,
       focusable_elem: this.edit_text_entry,
       auto_hide: this.total_lines <= 2,
     });
     let x_save = x;
     let y_save = y;
-    x = 0;
+    x = clip_offs;
     y = 0;
     let y_min = this.scroll_area.scroll_pos;
     let y_max = y_min + scroll_external_h;
@@ -745,18 +900,18 @@ ChatUI.prototype.run = function (opts) {
     }
     this.scroll_area.end(scroll_internal_h);
     x = x_save;
-    y = y_save - scroll_external_h;
+    y = y_save - scroll_external_h + scroll_grow;
     // Eat mouse events (not handled by above) in the scroll area to prevent unfocusing
-    input.mouseDownEdge({ x: camera2d.x0(), y: y - border, w: w + border + 8, h: y0 - y + border });
+    input.mouseDownEdge({ x: x0, y: y - border, w: outer_w, h: y1 - y + border });
     // But a click should dismiss it (important on fullscreen touch UI!)
-    if (input.mouseUpEdge({ x: camera2d.x0(), y: y - border, w: w + border + 8, h: y0 - y + border,
+    if (input.mouseUpEdge({ x: x0, y: y - border, w: outer_w, h: y1 - y + border,
       in_event_cb: opts.pointerlock ? input.pointerLockEnter : null })
     ) {
       ui.focusCanvas();
       is_focused = false;
     }
     // Also prevent mouseover from going to anything beneat it
-    input.mouseOver({ x: camera2d.x0(), y: y - border, w: w + border + 8, h: y0 - y + border });
+    input.mouseOver({ x: x0, y: y - border, w: outer_w, h: y1 - y + border });
     // Also a mouse down anywhere outside of the chat UI should dismiss it
     if (input.mouseDownEdge({ peek: true })) {
       // On touch, tapping doesn't always remove focus from the edit box!
@@ -793,7 +948,7 @@ ChatUI.prototype.run = function (opts) {
   if (!anything_visible && (ui.modal_dialog || ui.menu_up || hide_light)) {
     return;
   }
-  ui.drawRect(camera2d.x0(), y - border, x + w + border + 8, y0, z, [0.3,0.3,0.3,0.75]);
+  ui.drawRect(x0, y - border, x0 + outer_w, y1, z, [0.3,0.3,0.3,0.75]);
 };
 
 ChatUI.prototype.setChannel = function (channel) {
@@ -820,6 +975,7 @@ ChatUI.prototype.setChannel = function (channel) {
   let chat_history;
   let here;
   let here_map = {};
+  let friends;
   asyncParallel([
     (next) => {
       channel.send('chat_get', null, (err, data) => {
@@ -834,16 +990,27 @@ ChatUI.prototype.setChannel = function (channel) {
         let clients = data && data.public && data.public.clients;
         if (clients) {
           here = [];
+          friends = [];
           for (let client_id in clients) {
             let client = clients[client_id];
-            if (client.ids && client.ids.user_id && client.ids.display_name) {
-              here_map[client.ids.user_id] = client.ids.display_name;
+            let user_id = client.ids && client.ids.user_id;
+            let already_in_list = false;
+            if (user_id && client.ids.display_name) {
+              if (here_map[user_id]) {
+                already_in_list = true;
+              } else {
+                here_map[user_id] = client.ids.display_name;
+              }
             }
-            if (client_id === net.client.id) {
+            if (client_id === net.client.id || already_in_list) {
               continue;
             }
             if (client.ids) {
-              here.push(client.ids.display_name || client.ids.user_id || client_id);
+              if (user_id && isFriend(user_id)) {
+                friends.push(client.ids.display_name || user_id || client_id);
+              } else {
+                here.push(client.ids.display_name || user_id || client_id);
+              }
             }
           }
         }
@@ -851,6 +1018,10 @@ ChatUI.prototype.setChannel = function (channel) {
       });
     },
   ], () => {
+    if (!this.channel) {
+      // disconnected/left already
+      return;
+    }
     // First display chat history
     if (chat_history) {
       let messages_pre = this.msgs.slice(0);
@@ -877,9 +1048,16 @@ ChatUI.prototype.setChannel = function (channel) {
     // Then join message
     this.addChat(`Joined channel ${this.channel.channel_id}`, 'join_leave');
     // Then who's here now
-    if (here && here.length) {
+    if (here && here.length || friends && friends.length) {
+      let msg = [];
+      if (here.length) {
+        msg.push(`Other users already here: ${here.join(', ')}`);
+      }
+      if (friends.length) {
+        msg.push(`Friends already here: ${friends.join(', ')}`);
+      }
       this.addChatFiltered({
-        msg: `Other users already here: ${here.join(', ')}`,
+        msg: msg.join('\n'),
         style: 'join_leave',
       });
     }
@@ -893,12 +1071,41 @@ export function create(params) {
     if (!str) {
       return void resp_func(null, 'Usage: /me does something.');
     }
+
+    if (params.emote_cb) {
+      params.emote_cb(str);
+    }
+
     chat_ui.sendChat(FLAG_EMOTE, str);
   }
+  cmd_parse.registerValue('volume_chat_joinleave', {
+    type: cmd_parse.TYPE_FLOAT,
+    label: 'Join/Leave chat message volume',
+    range: [0,1],
+    get: () => chat_ui.volume_join_leave,
+    set: (v) => (chat_ui.volume_join_leave = v),
+    store: true,
+  });
+  cmd_parse.registerValue('volume_chat_in', {
+    type: cmd_parse.TYPE_FLOAT,
+    label: 'Incoming chat message volume',
+    range: [0,1],
+    get: () => chat_ui.volume_in,
+    set: (v) => (chat_ui.volume_in = v),
+    store: true,
+  });
+  cmd_parse.registerValue('volume_chat_out', {
+    type: cmd_parse.TYPE_FLOAT,
+    label: 'Outgoing chat message volume',
+    range: [0,1],
+    get: () => chat_ui.volume_out,
+    set: (v) => (chat_ui.volume_out = v),
+    store: true,
+  });
   cmd_parse.register({
     cmd: 'me',
     help: 'Emote',
-    usage: 'Emote\n  Example: /me jumps up and down!',
+    usage: '$HELP\n  Example: /me jumps up and down!',
     func: emote,
   });
   // Also alias /em
@@ -906,6 +1113,14 @@ export function create(params) {
     access_show: ['hidden'],
     cmd: 'em',
     func: emote,
+  });
+  cmd_parse.register({
+    cmd: 'echo',
+    help: 'Echo text locally',
+    func: (str, resp_func) => {
+      chat_ui.addChatFiltered({ msg: str });
+      resp_func();
+    },
   });
   return chat_ui;
 }

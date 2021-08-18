@@ -3,6 +3,9 @@
 // Some code from Turbulenz: Copyright (c) 2012-2013 Turbulenz Limited
 // Released under MIT License: https://opensource.org/licenses/MIT
 
+// eslint-disable-next-line no-use-before-define
+exports.createSprite = create;
+
 const assert = require('assert');
 const camera2d = require('./camera2d.js');
 const engine = require('./engine.js');
@@ -10,36 +13,36 @@ const geom = require('./geom.js');
 const { cos, max, min, round, sin } = Math;
 const textures = require('./textures.js');
 const shaders = require('./shaders.js');
-const { nextHighestPowerOfTwo } = require('../../common/util.js');
-const { vec2, vec4 } = require('./vmath.js');
+const { nextHighestPowerOfTwo } = require('glov/util.js');
+const { vec2, vec4 } = require('glov/vmath.js');
 
 export const BLEND_ALPHA = 0;
 export const BLEND_ADDITIVE = 1;
 
 let sprite_vshader;
-let sprite_fshader;
+export let sprite_fshader;
 let sprite_dual_fshader;
 let clip_space = vec4();
 let sprite_shader_params = {
   clip_space
 };
 let last_uid = 0;
+let geom_stats;
 
 let sprite_queue = [];
 
 let sprite_freelist = [];
 
-let sprite_queue_stack = null;
-export function spriteQueuePush() {
-  assert(!sprite_queue_stack);
-  sprite_queue_stack = sprite_queue;
-  sprite_queue = [];
+let sprite_queue_stack = [];
+export function spriteQueuePush(new_list) {
+  assert(sprite_queue_stack.length < 10); // probably leaking
+  sprite_queue_stack.push(sprite_queue);
+  sprite_queue = new_list || [];
 }
-export function spriteQueuePop() {
-  assert(sprite_queue_stack);
-  assert(!sprite_queue.length);
-  sprite_queue = sprite_queue_stack;
-  sprite_queue_stack = null;
+export function spriteQueuePop(for_pause) {
+  assert(sprite_queue_stack.length);
+  assert(for_pause || !sprite_queue.length);
+  sprite_queue = sprite_queue_stack.pop();
 }
 
 function SpriteData() {
@@ -134,6 +137,7 @@ export function queueraw4(
   //elem.bucket = bucket || this.default_bucket;
   //elem.tech_params = tech_params || null;
   elem.uid = ++last_uid;
+  ++geom_stats.sprites;
   sprite_queue.push(elem);
   return elem;
 }
@@ -231,10 +235,16 @@ export function queuesprite(sprite, x, y, z, w, h, rot, uvs, color, shader, shad
       if (tex.filter_mag === gl.LINEAR) {
         // Need to bias by half a texel, so we're doing absolutely no blending with the neighboring texel
         ubias = vbias = 0.5;
-      } else if (tex.filter_mag === gl.NEAREST && engine.antialias) {
-        // When antialiasing is on, even nearest sampling samples from adjacent texels, do slight bias
-        // Want to bias by one *pixel's* worth
-        ubias = vbias = zoom_level / 2;
+      } else if (tex.filter_mag === gl.NEAREST) {
+        if (engine.antialias) {
+          // When antialiasing is on, even nearest sampling samples from adjacent texels, do slight bias
+          // Want to bias by one *pixel's* worth
+          ubias = vbias = zoom_level / 2;
+        } else {
+          // even without it, running into problems, just add a tiny bias!
+          // In theory, don't want this if UVs are 0/1 and we're clamping?
+          ubias = vbias = zoom_level * 0.01;
+        }
       }
     } else if (zoom_level > 1) { // minification
       // need to apply this bias even with nearest filtering, not exactly sure why
@@ -265,6 +275,7 @@ export function queuesprite(sprite, x, y, z, w, h, rot, uvs, color, shader, shad
   } else {
     elem.shader_params = null;
   }
+  ++geom_stats.sprites;
   sprite_queue.push(elem);
 }
 
@@ -310,27 +321,35 @@ export function clip(z_start, z_end, x, y, w, h) {
 }
 
 let clip_stack = [];
+export function clipped() {
+  return clip_stack.length > 0;
+}
+
 export function clipPush(z, x, y, w, h) {
-  assert(clip_stack.length < 1); // do not currently support nesting; maybe leaking?
+  assert(clip_stack.length < 10); // probably leaking
   let scissor = clipCoordsScissor(x, y, w, h);
   let dom_clip = clipCoordsDom(x, y, w, h);
   camera2d.setInputClipping(dom_clip);
   spriteQueuePush();
   clip_stack.push({
-    z, scissor
+    z, scissor, dom_clip,
   });
 }
 
 export function clipPop() {
-  assert(clip_stack.length);
+  assert(clipped());
   queuefn(Z.TOOLTIP - 0.1, () => {
     gl.disable(gl.SCISSOR_TEST);
   });
   let { z, scissor } = clip_stack.pop();
   let sprites = sprite_queue;
-  sprite_queue = [];
-  spriteQueuePop();
-  camera2d.setInputClipping(null);
+  spriteQueuePop(true);
+  if (clip_stack.length) {
+    let { dom_clip } = clip_stack[clip_stack.length - 1];
+    camera2d.setInputClipping(dom_clip);
+  } else {
+    camera2d.setInputClipping(null);
+  }
   queuefn(z, () => {
     gl.enable(gl.SCISSOR_TEST);
     gl.scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
@@ -340,6 +359,29 @@ export function clipPop() {
     spriteQueuePop();
     // done at Z.TOOLTIP: gl.disable(gl.SCISSOR_TEST);
   });
+}
+
+let clip_paused;
+export function clipPause() {
+  // Queue back into the root sprite queue
+  assert(clipped());
+  assert(!clip_paused);
+  clip_paused = true;
+  spriteQueuePush(sprite_queue_stack[0]);
+  camera2d.setInputClipping(null);
+  // push onto the clip stack so if there's another clip push/pop we get back to
+  // escaped when it pops.
+  clip_stack.push({ dom_clip: null });
+}
+export function clipResume() {
+  assert(clipped());
+  assert(clip_paused);
+  clip_stack.pop(); // remove us
+  clip_paused = false;
+  assert(clipped());
+  let { dom_clip } = clip_stack[clip_stack.length - 1];
+  spriteQueuePop(true);
+  camera2d.setInputClipping(dom_clip);
 }
 
 function diffTextures(texsa, texsb) {
@@ -404,6 +446,7 @@ function commitAndFlush() {
       }
     }
     textures.bindArray(state.texs);
+    ++geom_stats.draw_calls_sprite;
     gl.drawElements(sprite_geom.mode, (end - start) * 3 / 2, gl.UNSIGNED_SHORT, start * 3);
   }
 
@@ -463,6 +506,9 @@ function bufferSpriteData(data) {
 }
 
 export function draw() {
+  if (engine.defines.NOSPRITES) {
+    sprite_queue.length = 0;
+  }
   if (!sprite_queue.length) {
     return;
   }
@@ -536,7 +582,7 @@ export function draw() {
   }
 }
 
-export function buildRects(ws, hs) {
+export function buildRects(ws, hs, tex) {
   let rects = [];
   let total_w = 0;
   for (let ii = 0; ii < ws.length; ++ii) {
@@ -546,8 +592,20 @@ export function buildRects(ws, hs) {
   for (let ii = 0; ii < hs.length; ++ii) {
     total_h += hs[ii];
   }
-  let tex_w = nextHighestPowerOfTwo(total_w);
-  let tex_h = nextHighestPowerOfTwo(total_h);
+  let tex_w;
+  let tex_h;
+  if (!tex || nextHighestPowerOfTwo(tex.src_width) === tex.width &&
+    nextHighestPowerOfTwo(tex.src_height) === tex.height
+  ) {
+    // texture is in fact power of two, or assume it will be
+    tex_w = nextHighestPowerOfTwo(total_w);
+    tex_h = nextHighestPowerOfTwo(total_h);
+  } else {
+    // Assume snuggly fitting, use the summed w/h, which might be a multiple of
+    //   the actual w/h, but should be correct relative to the specified `ws` and `hs`
+    tex_w = total_w;
+    tex_h = total_h;
+  }
   let wh = [];
   for (let ii = 0; ii < ws.length; ++ii) {
     wh.push(ws[ii] / total_h);
@@ -590,6 +648,7 @@ function Sprite(params) {
   if (params.texs) {
     this.texs = params.texs;
   } else {
+    let ext = params.ext || '.png';
     this.texs = [];
     if (params.tex) {
       this.texs.push(params.tex);
@@ -598,7 +657,7 @@ function Sprite(params) {
       this.texs = [];
       for (let ii = 0; ii < params.layers; ++ii) {
         this.texs.push(textures.load({
-          url: `img/${params.name}_${ii}.png`,
+          url: `img/${params.name}_${ii}${ext}`,
           filter_min: params.filter_min,
           filter_mag: params.filter_mag,
           wrap_s: params.wrap_s,
@@ -607,7 +666,7 @@ function Sprite(params) {
       }
     } else if (params.name) {
       this.texs.push(textures.load({
-        url: `img/${params.name}.png`,
+        url: `img/${params.name}${ext}`,
         filter_min: params.filter_min,
         filter_mag: params.filter_mag,
         wrap_s: params.wrap_s,
@@ -633,6 +692,9 @@ function Sprite(params) {
 
   if (params.ws) {
     this.uidata = buildRects(params.ws, params.hs);
+    this.texs[0].onLoad((tex) => {
+      this.uidata = buildRects(params.ws, params.hs, tex);
+    });
   }
   this.shader = params.shader || null;
 }
@@ -664,6 +726,7 @@ export function create(params) {
 }
 
 export function startup() {
+  geom_stats = geom.stats;
   clip_space[2] = -1;
   clip_space[3] = 1;
   sprite_vshader = shaders.create('glov/shaders/sprite.vp');

@@ -4,12 +4,14 @@
 
 const assert = require('assert');
 const camera2d = require('./camera2d.js');
+const geom = require('./geom.js');
 const { floor, max, round } = Math;
+// const settings = require('./settings.js');
 const shaders = require('./shaders.js');
 const sprites = require('./sprites.js');
 const textures = require('./textures.js');
-const { clamp } = require('../../common/util.js');
-const { vec4, v4clone, v4scale } = require('./vmath.js');
+const { clamp } = require('glov/util.js');
+const { vec4, v4clone, v4scale } = require('glov/vmath.js');
 
 /*
 
@@ -62,9 +64,10 @@ export const ALIGN = {
   VMASK: 3 << 2,
 
   HFIT: 1 << 4,
-  HWRAP: 1 << 5, // only for glovMarkup*, not drawSizedAligned below, use drawSizedWrapped below instead
+  HWRAP: 1 << 5,
 
   HCENTERFIT: 1 | (1 << 4),
+  HRIGHTFIT: 2 | (1 << 4),
   HVCENTER: 1 | (1 << 2), // to avoid doing bitwise ops elsewhere
   HVCENTERFIT: 1 | (1 << 2) | (1 << 4), // to avoid doing bitwise ops elsewhere
 };
@@ -108,7 +111,9 @@ export const ALIGN = {
 */
 
 function GlovFontStyle() {
-  this.color_vec4 = vec4(1,1,1,1); // Matches GlovFontStyle.prototype.color below
+  // Not calling `vec4()` directly, since this constructor may be called during
+  //   initialization before our local `vec4` has been assigned.
+  this.color_vec4 = new Float32Array([1,1,1,1]); // Matches GlovFontStyle.prototype.color below
 }
 GlovFontStyle.prototype.outline_width = 0;
 GlovFontStyle.prototype.outline_color = 0x00000000;
@@ -178,23 +183,24 @@ export function styleAlpha(font_style, alpha) {
 
 let tech_params = null;
 let tech_params_dirty = false;
-let temp_color = null;
+let tech_params_cache = [];
+let tech_params_cache_idx = 0;
+let temp_color = vec4();
+let geom_stats;
 
 function createTechniqueParameters() {
   if (tech_params) {
     return;
   }
 
+  geom_stats = geom.stats;
+
   tech_params = {
     param0: vec4(),
     outlineColor: vec4(),
     glowColor: vec4(),
     glowParams: vec4(),
-    tex0: null
   };
-  if (!temp_color) {
-    temp_color = vec4();
-  }
 }
 
 function techParamsSet(param, value) {
@@ -203,12 +209,15 @@ function techParamsSet(param, value) {
   if (!tech_params_dirty) {
     if (tpv[0] !== value[0] || tpv[1] !== value[1] || tpv[2] !== value[2] || tpv[3] !== value[3]) {
       // clone
+      // PERFTODO: Should not be cloning these vec4s every frame!
+      //   Should use a pool of them, but need to reset the tech_param_cache each frame.
       tech_params = {
         param0: v4clone(tech_params.param0),
         outlineColor: v4clone(tech_params.outlineColor),
         glowColor: v4clone(tech_params.glowColor),
         glowParams: v4clone(tech_params.glowParams),
       };
+      geom_stats.font_params++;
       tech_params_dirty = true;
       tpv = tech_params[param];
     } else {
@@ -226,8 +235,37 @@ function techParamsSet(param, value) {
   }
 }
 
+function sameTP(as) {
+  for (let key in tech_params) {
+    let v1 = tech_params[key];
+    let v2 = as[key];
+    for (let ii = 0; ii < 4; ++ii) {
+      if (v1[ii] !== v2[ii]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 function techParamsGet() {
+  if (!tech_params_dirty) {
+    return tech_params;
+  }
   tech_params_dirty = false;
+  for (let ii = 0; ii < tech_params_cache.length; ++ii) {
+    if (sameTP(tech_params_cache[ii])) {
+      tech_params = tech_params_cache[ii];
+      if (tech_params_cache_idx === ii) {
+        // about to be overwritten
+        tech_params_cache_idx = (tech_params_cache_idx + 1) % 4;
+      }
+      --geom_stats.font_params;
+      return tech_params;
+    }
+  }
+  tech_params_cache[tech_params_cache_idx] = tech_params;
+  tech_params_cache_idx = (tech_params_cache_idx + 1) % 4;
   return tech_params;
 }
 
@@ -248,10 +286,11 @@ function GlovFont(font_info, texture_name) {
   this.tex_w = font_info.imageW;
   this.tex_h = font_info.imageH;
 
-  // Calculate inverse scale
+  // Calculate inverse scale, fixup 0s
   for (let ii = 0; ii < font_info.char_infos.length; ++ii) {
     let char_info = font_info.char_infos[ii];
     char_info.scale = 1 / (char_info.sc || 1);
+    char_info.w = char_info.w || 0;
   }
 
   // build lookup
@@ -266,6 +305,7 @@ function GlovFont(font_info, texture_name) {
   if (!this.replacement_character) {
     this.replacement_character = this.infoFromChar(63); // '?'
   }
+  this.whitespace_character = this.infoFromChar(13);
 
   this.default_style = new GlovFontStyle();
   this.applied_style = new GlovFontStyle();
@@ -284,6 +324,9 @@ GlovFont.prototype.drawSized = function (style, x, y, z, size, text) {
 };
 
 GlovFont.prototype.drawSizedAligned = function (style, _x, _y, z, size, align, w, h, text) {
+  if (align & ALIGN.HWRAP) {
+    return this.drawSizedAlignedWrapped(style, _x, _y, z, size, align & ~ALIGN.HWRAP, w, h, text);
+  }
   let x_size = size;
   let y_size = size;
   let width = this.getStringWidth(style, x_size, text);
@@ -308,7 +351,7 @@ GlovFont.prototype.drawSizedAligned = function (style, _x, _y, z, size, align, w
     case ALIGN.HCENTER:
       x = _x + (w - width) / 2;
       if (this.font_info.noFilter) {
-        x |= 0; // ensure integral
+        x |= 0; // ensure integral - TODO: often only want this for pixely = strict modes?
       }
       break;
     case ALIGN.HRIGHT:
@@ -340,6 +383,44 @@ GlovFont.prototype.drawSizedAligned = function (style, _x, _y, z, size, align, w
   return this.drawScaled(style, x, y, z, x_size / this.font_info.font_size, y_size / this.font_info.font_size, text);
 };
 
+GlovFont.prototype.drawSizedAlignedWrapped = function (style, x, y, z, size, align, w, h, text) {
+  let indent = 0;
+  assert(w > 0);
+  this.applyStyle(style);
+  this.last_width = 0;
+  let lines = [];
+  this.wrapLines(w, indent, size, text, align, (xoffs, linenum, word) => {
+    let line = lines[linenum];
+    if (line) {
+      lines[linenum] = `${line} ${word}`; // This is mangling double spaces or tabs, but maybe fine?
+    } else {
+      lines[linenum] = word;
+    }
+  });
+
+  let yoffs = 0;
+  let height = size * lines.length;
+  // eslint-disable-next-line default-case
+  switch (align & ALIGN.VMASK) {
+    case ALIGN.VCENTER:
+      yoffs = (h - height) / 2;
+      if (this.font_info.noFilter) {
+        yoffs |= 0; // ensure integral
+      }
+      break;
+    case ALIGN.VBOTTOM:
+      yoffs = h - height;
+      break;
+  }
+  align &= ~ALIGN.VMASK;
+
+  for (let ii = 0; ii < lines.length; ++ii) {
+    this.drawSizedAligned(style, x, y + yoffs, z, size, align, w, 0, lines[ii]);
+    yoffs += size;
+  }
+  return yoffs;
+};
+
 // returns height
 GlovFont.prototype.drawSizedColorWrapped = function (style, x, y, z, w, indent, size, color, text) {
   return this.drawScaledWrapped(styleColored(style, color), x, y, z, w,
@@ -350,8 +431,9 @@ GlovFont.prototype.drawSizedWrapped = function (style, x, y, z, w, indent, size,
     indent, size / this.font_info.font_size, size / this.font_info.font_size, text);
 };
 
-GlovFont.prototype.wrapLines = function (w, indent, size, text, word_cb /*(x, int linenum, const char *word)*/) {
-  return this.wrapLinesScaled(w, indent, size / this.font_info.font_size, text, word_cb);
+// word_cb(x0, int linenum, const char *word, x1)
+GlovFont.prototype.wrapLines = function (w, indent, size, text, align_bits, word_cb) {
+  return this.wrapLinesScaled(w, indent, size / this.font_info.font_size, text, align_bits, word_cb);
 };
 
 GlovFont.prototype.numLines = function (style, w, indent, size, text) {
@@ -360,8 +442,23 @@ GlovFont.prototype.numLines = function (style, w, indent, size, text) {
   function wordCallback(ignored, linenum, word) {
     numlines = max(numlines, linenum);
   }
-  this.wrapLines(w, indent, size, text, wordCallback);
+  this.wrapLines(w, indent, size, text, 0, wordCallback);
   return numlines + 1;
+};
+
+GlovFont.prototype.dims = function (style, w, indent, size, text) {
+  this.applyStyle(style);
+  let numlines = 0;
+  let max_x1 = 0;
+  function wordCallback(ignored, linenum, word, x1) {
+    max_x1 = max(max_x1, x1);
+    numlines = max(numlines, linenum);
+  }
+  this.wrapLines(w, indent, size, text, 0, wordCallback);
+  return {
+    h: (numlines + 1) * size,
+    w: max_x1,
+  };
 };
 
 GlovFont.prototype.infoFromChar = function (c) {
@@ -369,11 +466,11 @@ GlovFont.prototype.infoFromChar = function (c) {
   if (ret) {
     return ret;
   }
-  if (c > 127) {
-    // no char info, and non-ascii, non-control code
-    return this.replacement_character;
+  if (c >= 9 && c <= 13) { // characters that String.trim() strip
+    return this.whitespace_character;
   }
-  return null;
+  // no char info, not whitespace, show replacement even if ascii, control code
+  return this.replacement_character;
 };
 
 GlovFont.prototype.getCharacterWidth = function (style, x_size, c) {
@@ -396,9 +493,6 @@ GlovFont.prototype.getStringWidth = function (style, x_size, text) {
   for (let ii = 0; ii < text.length; ++ii) {
     let c = text.charCodeAt(ii);
     let char_info = this.infoFromChar(c);
-    if (!char_info) {
-      char_info = this.infoFromChar(13);
-    }
     if (char_info) {
       ret += (char_info.w + char_info.xpad) * xsc * char_info.scale + x_advance;
     }
@@ -406,8 +500,9 @@ GlovFont.prototype.getStringWidth = function (style, x_size, text) {
   return ret;
 };
 
-// word_cb(x, int linenum, const char *word)
-GlovFont.prototype.wrapLinesScaled = function (w, indent, xsc, text, word_cb) {
+// word_cb(x0, int linenum, const char *word, x1)
+GlovFont.prototype.wrapLinesScaled = function (w, indent, xsc, text, align_bits, word_cb) {
+  assert(typeof align_bits !== 'function'); // Old API had one less parameter
   let len = text.length;
   let s = 0;
   let word_start = 0;
@@ -417,30 +512,23 @@ GlovFont.prototype.wrapLinesScaled = function (w, indent, xsc, text, word_cb) {
   let space_info = this.infoFromChar(32); // ' '
   let space_size = (space_info ? space_info.w + space_info.xpad : this.font_info.font_size) * xsc;
   let hard_wrap = false;
+  // "fit" mode: instead of breaking the too-long word, output it on a line of its own
+  let hard_wrap_mode_fit = align_bits & ALIGN.HFIT;
   let x_advance = this.calcXAdvance(xsc);
 
   do {
-    let c = s < len ? text.charCodeAt(s) : 0;
+    let c = s < len ? text.charCodeAt(s) || 0xFFFD : 0;
     let newx = x;
     let char_w;
-    if (c === 9) { // '\t') {
-      let tabsize = xsc * this.font_info.font_size * 4;
-      newx = (floor(x / tabsize) + 1) * tabsize;
-      char_w = tabsize;
-    } else {
-      let char_info = this.infoFromChar(c);
-      if (!char_info) {
-        char_info = this.infoFromChar(10);
-      }
-      if (char_info) {
-        char_w = (char_info.w + char_info.xpad) * xsc * char_info.scale + x_advance;
-        newx = x + char_w;
-      }
+    let char_info = this.infoFromChar(c);
+    if (char_info) {
+      char_w = (char_info.w + char_info.xpad) * xsc * char_info.scale + x_advance;
+      newx = x + char_w;
     }
-    if (newx >= w && hard_wrap) {
+    if (newx > w && hard_wrap) {
       // flush the word so far!
       if (word_cb) {
-        word_cb(word_x0, linenum, text.slice(word_start, s));
+        word_cb(word_x0, linenum, text.slice(word_start, s), x);
       }
       word_start = s;
       word_x0 = indent;
@@ -449,41 +537,44 @@ GlovFont.prototype.wrapLinesScaled = function (w, indent, xsc, text, word_cb) {
     } else {
       x = newx;
     }
-    if (!(c === 32 /*' '*/ || c === 0 || c === 10 /*'\n'*/)) {
+    if (!(c === 32 /*' '*/ || c === 0 || c === 10 /*'\n'*/ || c === 9)) {
       s++;
-      c = s < len ? text.charCodeAt(s) : 0;
+      c = s < len ? text.charCodeAt(s) || 0xFFFD : 0;
     }
-    if (c === 32 /*' '*/ || c === 0 || c === 10 /*'\n'*/) {
+    if (c === 32 /*' '*/ || c === 0 || c === 10 /*'\n'*/ || c === 9) {
       hard_wrap = false;
       // draw word until s
       if (x > w) {
         // maybe wrap
         let word_width = x - word_x0;
-        if (word_width > w - indent) {
+        if (word_width > w - indent && !hard_wrap_mode_fit) {
           // not going to fit, split it up!
           hard_wrap = true;
           // recover and restart at word start
           s = word_start;
           x = word_x0;
           continue;
-        } else {
+        } else if (linenum || word_x0) {
           word_x0 = indent;
           x = word_x0 + word_width;
           linenum++;
         }
       }
       if (word_cb) {
-        word_cb(word_x0, linenum, text.slice(word_start, s));
+        word_cb(word_x0, linenum, text.slice(word_start, s), x);
       }
       word_start = s+1;
       if (c === 10 /*'\n'*/) {
         x = indent;
         linenum++;
+      } else if (c === 9 /*'\t'*/) {
+        let tabsize = xsc * this.font_info.font_size * 2;
+        x = (floor(x / tabsize) + 1) * tabsize;
       } else {
         x += space_size;
       }
       word_x0 = x;
-      if (c === 32 /*' '*/ || c === 10 /*'\n'*/) {
+      if (c === 32 /*' '*/ || c === 10 /*'\n'*/ || c === 9) {
         s++; // advance past space
       }
     }
@@ -496,9 +587,10 @@ GlovFont.prototype.drawScaledWrapped = function (style, x, y, z, w, indent, xsc,
   if (text === null || text === undefined) {
     text = '(null)';
   }
+  assert(w > 0);
   this.applyStyle(style);
   this.last_width = 0;
-  let num_lines = this.wrapLinesScaled(w, indent, xsc, text, (xoffs, linenum, word) => {
+  let num_lines = this.wrapLinesScaled(w, indent, xsc, text, 0, (xoffs, linenum, word) => {
     let y2 = y + this.font_info.font_size * ysc * linenum;
     let x2 = x + xoffs;
     let word_w = this.drawScaled(style, x2, y2, z, xsc, ysc, word);
@@ -514,7 +606,7 @@ GlovFont.prototype.calcXAdvance = function (xsc) {
   //   things look almost identical, just crisper
   let font_texel_scale = this.font_info.font_size / 32;
   // As a compromise, -2 bias here seems to work well
-  let x_advance = xsc * font_texel_scale * max(this.applied_style.outline_width - 2, 0);
+  let x_advance = round(xsc * font_texel_scale * max(this.applied_style.outline_width - 2, 0));
   // As a compromise, there's a -3 bias in there, so it only kicks in under extreme circumstances
   x_advance = max(x_advance, xsc * font_texel_scale *
     max(this.applied_style.glow_outer - this.applied_style.glow_xoffs - 3, 0));
@@ -544,13 +636,16 @@ GlovFont.prototype.drawScaled = function (style, _x, y, z, xsc, ysc, text) {
     return 0;
   }
 
+  geom_stats.font_calls++;
+
   this.applyStyle(style);
 
   const avg_scale_font = (xsc + ysc) * 0.5;
   const camera_xscale = camera2d.data[4];
   const camera_yscale = camera2d.data[5];
   let avg_scale_combined = (xsc * camera_xscale + ysc * camera_yscale) * 0.5;
-  // avg_scale_combined *= glov_settings.render_scale;
+  // Not doing this here, because render_scale_all is not currently reflected in camera_x/yscale
+  // avg_scale_combined *= settings.render_scale_all;
 
   // scale all supplied values by this so that if we swap in a font with twice the resolution (and twice the spread)
   //   things look almost identical, just crisper
@@ -606,12 +701,15 @@ GlovFont.prototype.drawScaled = function (style, _x, y, z, xsc, ysc, text) {
   }
 
   // Choose appropriate z advance so that character are drawn left to right (or RTL if the glow is on the other side)
-  const z_advance = applied_style.glow_xoffs < 0 ? -0.0001 : 0.0001;
+  // same Z should be drawn in queue order, so not needed
+  const z_advance = applied_style.glow_xoffs < 0 ? -0.0001 : 0; // 0.0001;
 
 
   // For non-1:1 aspect ration rendering, need to scale our coordinates' padding differently in each axis
   let rel_x_scale = xsc / avg_scale_font;
   let rel_y_scale = ysc / avg_scale_font;
+
+  let sort_y = (y - camera2d.data[1]) * camera2d.data[5];
 
   for (let i=0; i<len; i++) {
     const c = text.charCodeAt(i);
@@ -620,9 +718,6 @@ GlovFont.prototype.drawScaled = function (style, _x, y, z, xsc, ysc, text) {
       x = ((((x - _x) / tabsize) | 0) + 1) * tabsize + _x;
     } else {
       let char_info = this.infoFromChar(c);
-      if (!char_info) {
-        char_info = this.infoFromChar(13);
-      }
       if (char_info) {
         let char_scale = char_info.scale;
         let xsc2 = xsc * char_scale;
@@ -636,6 +731,7 @@ GlovFont.prototype.drawScaled = function (style, _x, y, z, xsc, ysc, text) {
             value2[0] = -applied_style.glow_xoffs * font_texel_scale * pad_scale / tile_width;
             value2[1] = -applied_style.glow_yoffs * font_texel_scale * pad_scale / tile_height;
             techParamsSet('glowParams', value2);
+            tile_state = char_scale;
           }
 
           let u0 = (char_info.x0 - padding_in_font_space[0] * pad_scale) / tile_width;
@@ -646,13 +742,14 @@ GlovFont.prototype.drawScaled = function (style, _x, y, z, xsc, ysc, text) {
           let w = char_info.w * xsc2 + (padding4[0] + padding4[2]) * rel_x_scale;
           let h = char_info.h * ysc2 + (padding4[1] + padding4[3]) * rel_y_scale;
 
-          sprites.queueraw(
+          let elem = sprites.queueraw(
             texs,
             x - rel_x_scale * padding4[0], y - rel_y_scale * padding4[2] + char_info.yoffs * ysc2,
             z + z_advance * i, w, h,
             u0, v0, u1, v1,
             applied_style.color_vec4,
             this.shader, techParamsGet());
+          elem.y = sort_y;
 
           // require('./ui.js').drawRect(x - rel_x_scale * padding4[0],
           //   y - rel_y_scale * padding4[2] + char_info.yoffs * ysc2,

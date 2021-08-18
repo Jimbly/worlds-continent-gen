@@ -1,8 +1,8 @@
-/* eslint no-invalid-this:off */
 const assert = require('assert');
-const log = require('fancy-log');
-const through = require('through2');
-const Vinyl = require('vinyl');
+const concat = require('glov-build-concat');
+const gb = require('glov-build');
+const { forwardSlashes } = gb;
+const path = require('path');
 
 const preamble = `(function () {
 var fs = window.glov_webfs = window.glov_webfs || {};`;
@@ -42,35 +42,25 @@ function encodeString(buf) {
   return ret.join('');
 }
 
-module.exports = function () {
-  let files = [];
-  return through.obj(function transform(file, encoding, callback) {
-    if (file.isDirectory()) {
-      return void callback();
-    }
-    assert(file.isBuffer());
-    let data = file.contents;
-    let name = file.relative.replace(/\\/g, '/').replace('autogen/', '');
-    files.push({ name, data });
-    callback();
-  }, function flush(cb) {
-    if (!files.length) {
-      return void cb();
-    }
-    log(`webfs(${files.length} files)`);
-    let output = [preamble];
-    for (let ii = 0; ii < files.length; ++ii) {
-      let name = files[ii].name;
-      let data = files[ii].data;
-      output.push(`fs['${name}'] = [${data.length},'${encodeString(data)}'];`);
-    }
+function fileFSName(opts, name) {
+  name = forwardSlashes(name).replace('autogen/', '');
+  if (opts.base) {
+    name = forwardSlashes(path.relative(opts.base, name));
+  }
+  return name;
+}
 
-    output.push(postamble);
-    this.push(new Vinyl({
-      // base: file.base,
-      path: 'fsdata.js',
-      contents: Buffer.from(output.join('\n')),
-    }));
-    cb();
+module.exports = function webfsBuild(opts) {
+  assert(opts.output);
+  return concat({
+    preamble,
+    postamble,
+    output: opts.output,
+    proc: function (job, file, next) {
+      let name = fileFSName(opts, file.relative);
+      let data = file.contents;
+      let line = `fs['${name}'] = [${data.length},'${encodeString(data)}'];`;
+      next(null, { contents: line });
+    },
   });
 };

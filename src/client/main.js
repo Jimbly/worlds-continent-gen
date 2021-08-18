@@ -1,13 +1,13 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
-/*eslint global-require:off, no-labels:off*/
-const glov_local_storage = require('./glov/local_storage.js');
-glov_local_storage.storage_prefix = 'macrogen'; // Before requiring anything else that might load from this
+/*eslint global-require:off, no-labels:off, no-dupe-else-if:off */
+const local_storage = require('glov/local_storage.js');
+local_storage.setStoragePrefix('macrogen'); // Before requiring anything else that might load from this
 
 const assert = require('assert');
 const { calculateBiomesTest } = require('./biome_test.js');
-const camera2d = require('./glov/camera2d.js');
+const camera2d = require('glov/camera2d.js');
 const continent_gen = require('./continent_gen.js');
 const { continentDeserialize, continentSerialize } = require('./continent_serialize.js');
 const { continentSerializeTest } = require('./continent_serialize_test.js');
@@ -21,22 +21,22 @@ const {
   D_COASTLINE,
   D_LAKE,
 } = continent_gen;
-const engine = require('./glov/engine.js');
-const input = require('./glov/input.js');
-const { linkText } = require('./glov/link.js');
+const engine = require('glov/engine.js');
+const input = require('glov/input.js');
+const { linkText } = require('glov/link.js');
 const { min, floor, round, sqrt } = Math;
-const net = require('./glov/net.js');
+const net = require('glov/net.js');
 const { C_WATER,C_RIVER_DELTA, C_PLAINS, C_MOUNTAINS } = require('./proc_gen_constants.js');
-const shaders = require('./glov/shaders.js');
-const sprites = require('./glov/sprites.js');
-const textures = require('./glov/textures.js');
-const ui = require('./glov/ui.js');
-const { clamp, clone } = require('../common/util.js');
+const shaders = require('glov/shaders.js');
+const sprites = require('glov/sprites.js');
+const textures = require('glov/textures.js');
+const ui = require('glov/ui.js');
+const { clamp, clone } = require('glov/util.js');
 const {
   vec2, v2mul, v2sub,
   vec3, v3lerp, v3scale, v3set,
   vec4,
-} = require('./glov/vmath.js');
+} = require('glov/vmath.js');
 
 window.Z = window.Z || {};
 Z.BACKGROUND = 1;
@@ -62,6 +62,7 @@ export function main() {
   }
 
   if (!engine.startup({
+    font: { info: require('./img/font/04b03_8x2.json'), texture: 'font/04b03_8x2' },
     antialias: true,
     game_width,
     game_height,

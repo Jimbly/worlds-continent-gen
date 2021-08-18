@@ -13,8 +13,8 @@ const { KEYS, PAD } = input;
 const { max, min, round } = Math;
 const { clipPush, clipPop } = require('./sprites.js');
 const ui = require('./ui.js');
-const { clamp } = require('../../common/util.js');
-const { vec2, vec4 } = require('./vmath.js');
+const { clamp } = require('glov/util.js');
+const { vec2, vec4 } = require('glov/vmath.js');
 
 const MAX_OVERSCROLL = 50;
 const OVERSCROLL_DELAY_WHEEL = 180;
@@ -28,11 +28,13 @@ export function setPixelScale(scale) {
   default_pixel_scale = scale;
 }
 
+let last_scroll_area_id = 0;
 function ScrollArea(params) {
   // configuration options
+  this.id = ++last_scroll_area_id;
   this.x = 0;
   this.y = 0;
-  this.z = Z.UI; // actually in DOM, so above everything!
+  this.z = Z.UI;
   this.w = 10;
   this.h = 10; // height of visible area, not scrolled area
   this.rate_scroll_click = ui.font_height;
@@ -41,7 +43,10 @@ function ScrollArea(params) {
   this.color = vec4(1,1,1,1);
   this.background_color = vec4(0.8, 0.8, 0.8, 1); // can be null
   this.auto_scroll = false; // If true, will scroll to the bottom if the height changes and we're not actively scrolling
+  this.auto_hide = false; // If true, will hide the scroll bar when the scroll area does not require it
+  this.no_disable = false; // Use with auto_hide=false to always do scrolling actions (overscroll, mousewheel)
   this.focusable_elem = null; // Another element to call .focus() on if we think we are focused
+  this.min_dist = undefined; // Minimum drag distance for background drag
   this.applyParams(params);
 
   // Calculated (only once) if not set
@@ -67,6 +72,7 @@ function ScrollArea(params) {
   this.focused = false;
   this.was_disabled = false;
   this.scrollbar_visible = false;
+  this.last_max_value = 0;
 }
 
 ScrollArea.prototype.applyParams = function (params) {
@@ -90,9 +96,10 @@ ScrollArea.prototype.isFocused = function () {
 
 ScrollArea.prototype.begin = function (params) {
   this.applyParams(params);
-  let { x, y, w, h, z } = this;
-  assert(!this.began); // Checking mismatched begin/end
+  let { x, y, w, h, z, id } = this;
+  assert(!this.began || engine.DEBUG); // Checking mismatched begin/end
   this.began = true;
+  ui.focusIdSet(id);
   // Set up camera and clippers
   clipPush(z + 0.05, x, y, w - this.barWidth(), h);
   let camera_orig_x0 = camera2d.x0();
@@ -153,6 +160,7 @@ ScrollArea.prototype.end = function (h) {
   h = max(h, 1); // prevent math from going awry on height of 0
   assert(this.began); // Checking mismatched begin/end
   this.began = false;
+  ui.focusIdSet(null);
   // restore camera and clippers
   camera2d.pop();
   clipPop();
@@ -165,7 +173,7 @@ ScrollArea.prototype.end = function (h) {
     let dt = engine.getFrameDt();
     if (dt >= this.overscroll_delay) {
       this.overscroll_delay = 0;
-      this.overscroll = this.overscroll * max(1 - dt * 0.008, 0);
+      this.overscroll *= max(1 - dt * 0.008, 0);
     } else {
       this.overscroll_delay -= dt;
     }
@@ -192,15 +200,23 @@ ScrollArea.prototype.end = function (h) {
   handle_pos = clamp(handle_pos, 0, 1);
   let handle_pixel_h = handle_h * (this.h - button_h_nopad * 2);
   let handle_pixel_min_h = scrollbar_handle.uidata.total_h * pixel_scale;
-  handle_pixel_h = max(handle_pixel_h, min(handle_pixel_min_h, button_h / 2));
+  let trough_height = this.h - button_h * 2;
+  handle_pixel_h = max(handle_pixel_h, min(handle_pixel_min_h, trough_height * 0.75));
   let handle_screenpos = round(this.y + button_h_nopad + handle_pos * (this.h - button_h_nopad * 2 - handle_pixel_h));
   let top_color = this.color;
   let bottom_color = this.color;
   let handle_color = this.color;
   let trough_color = this.color;
   let disabled = false;
-  if (!this.h || handle_h === 1) {
+  if (!this.h) {
     disabled = true;
+  } else if (handle_h === 1) {
+    if (this.no_disable) {
+      // Just *look* disabled, but still do overscroll, eat mousewheel events
+      trough_color = top_color = bottom_color = handle_color = this.disabled_color;
+    } else {
+      disabled = true;
+    }
   }
   this.was_disabled = disabled;
 
@@ -301,13 +317,14 @@ ScrollArea.prototype.end = function (h) {
 
     // handle clicking trough if not caught by anything above +/-
     let click;
-    while ((click = input.mouseUpEdge({
+    let bar_param = {
       x: bar_x0,
       y: this.y,
       w: bar_w,
       h: this.h,
       button: 0
-    }))) {
+    };
+    while ((click = input.mouseUpEdge(bar_param))) {
       ui.focusSteal(this);
       if (click.pos[1] > handle_screenpos + handle_pixel_h/2) {
         this.scroll_pos += this.h;
@@ -316,9 +333,11 @@ ScrollArea.prototype.end = function (h) {
       }
       user_moved_this_frame = true;
     }
+    // Catch mouse over on trough
+    input.mouseOver(bar_param);
 
     // handle dragging the scroll area background
-    let drag = input.drag({ x: this.x, y: this.y, w: this.w - bar_w, h: this.h, button: 0 });
+    let drag = input.drag({ x: this.x, y: this.y, w: this.w - bar_w, h: this.h, button: 0, min_dist: this.min_dist });
     if (drag) {
       // Drag should not steal focus
       // This also fixes an interaction with chat_ui where clicking on the chat background (which causes
@@ -353,7 +372,9 @@ ScrollArea.prototype.end = function (h) {
   this.last_internal_h = h;
   this.last_frame = engine.getFrameIndex();
 
-  let bg_color = this.focused ? this.background_color_focused : this.background_color;
+  let bg_color = this.focused || this.focusable_elem && this.focusable_elem.is_focused ?
+    this.background_color_focused :
+    this.background_color;
   if (bg_color) {
     ui.drawRect(this.x, this.y, this.x + this.w, this.y + this.h, this.z, bg_color);
   }
@@ -374,9 +395,14 @@ ScrollArea.prototype.end = function (h) {
     w: bar_w, h: button_h,
     color: bottom_color,
   });
+  let trough_draw_pad = button_h / 2;
+  let trough_draw_height = trough_height + trough_draw_pad * 2;
+  let trough_v0 = -trough_draw_pad / pixel_scale / scrollbar_trough.uidata.total_h;
+  let trough_v1 = trough_v0 + trough_draw_height / pixel_scale / scrollbar_trough.uidata.total_h;
   scrollbar_trough.draw({
-    x: bar_x0, y: this.y + button_h / 2, z: this.z+0.1,
-    w: bar_w, h: this.h - button_h,
+    x: bar_x0, y: this.y + trough_draw_pad, z: this.z+0.1,
+    w: bar_w, h: trough_draw_height,
+    uvs: [scrollbar_trough.uvs[0], trough_v0, scrollbar_trough.uvs[2], trough_v1],
     color: trough_color,
   });
 
@@ -410,6 +436,11 @@ ScrollArea.prototype.scrollIntoFocus = function (miny, maxy, h) {
     // Make it smooth/bouncy a bit
     this.overscroll = old_scroll_pos - this.scroll_pos;
   }
+};
+
+ScrollArea.prototype.resetScroll = function () {
+  this.scroll_pos = 0;
+  this.overscroll = 0;
 };
 
 export function scrollAreaCreate(params) {

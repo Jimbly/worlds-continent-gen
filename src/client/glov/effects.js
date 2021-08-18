@@ -3,11 +3,15 @@
 // Some code from Turbulenz: Copyright (c) 2012-2013 Turbulenz Limited
 // Released under MIT License: https://opensource.org/licenses/MIT
 
+const assert = require('assert');
 const engine = require('./engine.js');
+const { renderWidth, renderHeight } = engine;
+const { framebufferEnd, framebufferStart, framebufferTopOfFrame } = require('./framebuffer.js');
 const geom = require('./geom.js');
 const shaders = require('./shaders.js');
+const sprites = require('./sprites.js');
 const textures = require('./textures.js');
-const { vec2, vec3, vec4, v4set } = require('./vmath.js');
+const { vec2, vec3, vec4, v4set } = require('glov/vmath.js');
 
 const shader_data = {
   vp_copy: {
@@ -122,6 +126,39 @@ function startup() {
     copy_uv_scale,
     orig_pixel_size: vec4(),
   };
+}
+
+let num_passes = 0;
+export function effectsPassAdd() {
+  ++num_passes;
+}
+export function effectsPassConsume() {
+  assert(num_passes);
+  --num_passes;
+}
+
+function doEffect(fn) {
+  effectsPassConsume();
+  fn();
+}
+
+export function effectsQueue(z, fn) {
+  effectsPassAdd();
+  sprites.queuefn(z, doEffect.bind(null, fn));
+}
+
+export function effectsTopOfFrame() {
+  // In case of crash on previous frame
+  num_passes = 0;
+  framebufferTopOfFrame();
+}
+
+export function effectsReset() {
+  assert.equal(num_passes, 0); // otherwise probably still have a framebuffer bound
+}
+
+export function effectsIsFinal() {
+  return !num_passes;
 }
 
 export function grayScaleMatrix(dst) {
@@ -252,17 +289,46 @@ export function contrastMatrix(dst, contrastScale) {
   dst[9] = dst[10] = dst[11] = 0.5 * (1 - contrastScale);
 }
 
-// effect: { shader, params, texs }
+// effect: { shader, params, texs, final }
 function applyEffect(effect, view_w, view_h) {
-  let viewport = engine.viewport;
-  let target_w = viewport[2];
-  let target_h = viewport[3];
-  view_w = view_w || target_w;
-  view_h = view_h || target_h;
+  let final = effect.final !== false && effectsIsFinal() || effect.final;
+  if (effect.no_framebuffer) {
+    // neither starting nor ending a framebuffer, presumably something effectively additive
+    let viewport = engine.viewport;
+    let target_w = viewport[2];
+    let target_h = viewport[3];
+    view_w = view_w || target_w;
+    view_h = view_h || target_h;
+    clip_space[0] = 2.0 * view_w / target_w;
+    clip_space[1] = 2.0 * view_h / target_h;
+  } else if (effect.viewport) {
+    let { viewport } = effect;
+    let target_w = viewport[2];
+    let target_h = viewport[3];
+    view_w = view_w || target_w;
+    view_h = view_h || target_h;
 
-  // Set values for parameters used by all effects
-  clip_space[0] = 2.0 * view_w / target_w;
-  clip_space[1] = 2.0 * view_h / target_h;
+    clip_space[0] = 2.0 * view_w / target_w;
+    clip_space[1] = 2.0 * view_h / target_h;
+
+    framebufferStart({
+      clear: effect.clear,
+      clear_all: effect.clear_all,
+      clear_color: effect.clear_color,
+      viewport,
+      final,
+    });
+  } else {
+    clip_space[0] = 2.0;
+    clip_space[1] = 2.0;
+    view_w = view_w || renderWidth();
+    view_h = view_h || renderHeight();
+
+    framebufferStart({
+      width: view_w, height: view_h,
+      final,
+    });
+  }
   // clip_space[2] = -1.0;
   // clip_space[3] = -1.0;
   // copy_uv_scale[0] = target_w / effect.coord_source.width;
@@ -340,11 +406,18 @@ export function applyCopy(params) {
   if (!inited) {
     startup();
   }
-  applyEffect({
-    shader: params.shader || 'copy',
-    params: shader_params_default,
-    texs: [params.source],
-  });
+  let source = params.source;
+  if (!source) {
+    source = framebufferEnd({ filter_linear: params.filter_linear, need_depth: params.need_depth });
+  }
+  params.shader = params.shader || 'copy';
+  params.params = shader_params_default;
+  if (Array.isArray(source)) {
+    params.texs = source;
+  } else {
+    params.texs = [source];
+  }
+  applyEffect(params);
 }
 
 export function applyPixelyExpand(params) {
@@ -352,12 +425,10 @@ export function applyPixelyExpand(params) {
     startup();
   }
   let source = params.source;
-  source.setSamplerState({
-    filter_min: gl.LINEAR,
-    filter_mag: gl.LINEAR,
-    wrap_s: gl.CLAMP_TO_EDGE,
-    wrap_t: gl.CLAMP_TO_EDGE,
-  });
+  assert(!source); // would need linear/non-wrap sampler state set
+  if (!source) {
+    source = framebufferEnd({ filter_linear: true });
+  }
 
   // do horizontal blur for primary lines
   let resx = source.width;
@@ -370,8 +441,9 @@ export function applyPixelyExpand(params) {
     shader: 'gaussian_blur',
     params: shader_params_gaussian_blur,
     texs: [source],
+    final: false,
   }, resx, resy);
-  let hblur = engine.captureFramebuffer(null, resx, resy, true, false);
+  let hblur = framebufferEnd({ filter_linear: true });
 
   // do seperable gaussian blur for scanlines (using horizontal blur from above)
   sampleRadius = (params.vblur || 0.75) / resy;
@@ -382,23 +454,23 @@ export function applyPixelyExpand(params) {
     shader: 'gaussian_blur',
     params: shader_params_gaussian_blur,
     texs: [hblur],
+    final: false,
   }, resx, resy);
-  let vblur = engine.captureFramebuffer(null, resx, resy, true, false);
+  let vblur = framebufferEnd({ filter_linear: true });
 
   // combine at full res
   v4set(shader_params_pixely_expand.orig_pixel_size,
     source.width, source.height, 1/source.width, 1/source.height);
 
-  engine.setViewport(params.final_viewport);
-  if (params.clear_color) {
-    gl.clearColor(params.clear_color[0], params.clear_color[1], params.clear_color[2], params.clear_color[3]);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-  }
-
   applyEffect({
     shader: 'pixely_expand',
     params: shader_params_pixely_expand,
     texs: [source, hblur, vblur],
+
+    clear: params.clear,
+    clear_all: params.clear_all,
+    clear_color: params.clear_color,
+    viewport: params.viewport,
   });
 }
 
@@ -406,13 +478,7 @@ export function applyGaussianBlur(params) {
   if (!inited) {
     startup();
   }
-  let source = params.source;
-  source.setSamplerState({
-    filter_min: gl.LINEAR,
-    filter_mag: gl.LINEAR,
-    wrap_s: gl.CLAMP_TO_EDGE,
-    wrap_t: gl.CLAMP_TO_EDGE,
-  });
+  let source = framebufferEnd({ filter_linear: true });
   let max_size = params.max_size || 512;
   let min_size = params.min_size || 128;
 
@@ -430,8 +496,9 @@ export function applyGaussianBlur(params) {
       shader: params.shader_copy || 'copy',
       params: shader_params_default,
       texs: [inputTexture0],
+      final: false,
     }, res, res);
-    inputTexture0 = engine.captureFramebuffer(null, res, res, true, false);
+    inputTexture0 = framebufferEnd({ filter_linear: true });
     res /= 2;
   }
 
@@ -444,8 +511,9 @@ export function applyGaussianBlur(params) {
     shader: 'gaussian_blur',
     params: shader_params_gaussian_blur,
     texs: [inputTexture0],
+    final: false,
   }, res, res);
-  let blur = engine.captureFramebuffer(null, res, res, true, false);
+  let blur = framebufferEnd({ filter_linear: true });
 
   shader_params_gaussian_blur.sampleRadius[0] = 0;
   shader_params_gaussian_blur.sampleRadius[1] = sampleRadius;
@@ -463,13 +531,7 @@ export function applyColorMatrix(params) {
   if (!inited) {
     startup();
   }
-  let source = params.source;
-  source.setSamplerState({
-    filter_min: gl.LINEAR,
-    filter_mag: gl.LINEAR,
-    wrap_s: gl.CLAMP_TO_EDGE,
-    wrap_t: gl.CLAMP_TO_EDGE,
-  });
+  let source = framebufferEnd({ filter_linear: true });
 
   let matrix = params.colorMatrix;
   let mout = shader_params_color_matrix.colorMatrix;
@@ -576,7 +638,7 @@ export function clearAlpha() {
     gl.disable(gl.DEPTH_TEST);
   }
   gl.colorMask(false, false, false, true);
-  applyCopy({ source: textures.textures.white });
+  applyCopy({ source: textures.textures.white, no_framebuffer: true });
   gl.colorMask(true, true, true, true);
   if (old_dt) {
     gl.enable(gl.DEPTH_TEST);

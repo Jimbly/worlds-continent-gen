@@ -1,10 +1,25 @@
 const assert = require('assert');
-const { deepEqual } = require('../../common/util.js');
+const { deepEqual } = require('glov/util.js');
 const { getUID } = require('./log.js');
 
-function DataStoreMirror(readwrite_ds, write_ds) {
-  this.readwrite_ds = readwrite_ds;
-  this.write_ds = write_ds;
+function DataStoreMirror(options) {
+  this.readwrite_ds = options.readwrite;
+  this.write_ds = options.write;
+  if (!options.read_check) {
+    // Simply pass through
+    this.getAsync = this.readwrite_ds.getAsync.bind(this.readwrite_ds);
+    if (this.readwrite_ds.getAsyncBuffer) {
+      this.getAsyncBuffer = this.readwrite_ds.getAsyncBuffer.bind(this.readwrite_ds);
+    } else {
+      // Not supported on this kind of data store (metadata)
+      this.getAsyncBuffer = null;
+    }
+  }
+  if (this.readwrite_ds.search) {
+    this.search = this.readwrite_ds.search.bind(this.readwrite_ds);
+  } else if (this.write_ds.search) {
+    this.search = this.write_ds.search.bind(this.write_ds);
+  }
 }
 
 DataStoreMirror.prototype.unload = function (obj_name) {
@@ -23,15 +38,19 @@ function DoubleCall(type, obj_name, cb) {
   this.data_ret = [];
   this.received = [];
   this.uid = getUID();
+  this.start = Date.now();
+  this.timeout_error = [];
   this.timeout = setTimeout(() => {
     let missing = [];
     let got_rw = this.received[0];
     let got_w = this.received[1];
     if (!got_rw) {
       missing.push('readwrite');
+      this.timeout_error[0] = true;
     }
     if (!got_w) {
       missing.push('write-only');
+      this.timeout_error[1] = true;
     }
     console.error(`DATASTOREMIRROR(${type}:${this.uid}) Error: No response to ${obj_name}` +
       ` received after 60s from ${missing.join(',')}`);
@@ -47,6 +66,18 @@ DoubleCall.prototype.onDone = function (idx, err, data) {
     assert(!received[idx]);
     received[idx] = -1;
   } else {
+    let dt = Date.now() - this.start;
+    if (dt > 15000) {
+      let msg = 'Slow response for ' +
+        `${idx?'write-only':'readwrite'}:${this.obj_name}` +
+        ` (${(dt/1000).toFixed(1)}s elapsed)`;
+      if (this.timeout_error[idx]) {
+        console.error(`DATASTOREMIRROR(${this.type}:${this.uid}) Finally received ${msg}`);
+      } else {
+        console.warn(`DATASTOREMIRROR(${this.type}:${this.uid}) ${msg}`);
+      }
+    }
+
     if (received[idx]) {
       if (received[idx] === -1) {
         console.error(`DATASTOREMIRROR(${this.type}:${this.uid}) Callback finally called for ${idx}:${this.obj_name}`);
@@ -71,10 +102,10 @@ DataStoreMirror.prototype.setAsync = function (obj_name, value, cb) {
   let wrapped = new DoubleCall('set', obj_name, function (err_ret, data_ret) {
     // Neither is ever expected to error on write
     if (err_ret[0]) {
-      console.error(`DATASTOREMIRROR(set:${wrapped.uid}) Write error on 0:${obj_name}:`, err_ret[0]);
+      console.error(`DATASTOREMIRROR(set:${wrapped.uid}) Write error on readwrite:${obj_name}:`, err_ret[0]);
     }
     if (err_ret[1]) {
-      console.error(`DATASTOREMIRROR(set:${wrapped.uid}) Write error on 1:${obj_name}:`, err_ret[1]);
+      console.error(`DATASTOREMIRROR(set:${wrapped.uid}) Write error on write-only:${obj_name}:`, err_ret[1]);
       if (!err_ret[0]) {
         console.warn(`DATASTOREMIRROR(set:${wrapped.uid}) ...but primary succeeded, returning success`);
       }
@@ -96,8 +127,8 @@ function logMismatch(label, uid, obj_name, ret0, ret1) {
     }
   }
   console.error(`DATASTOREMIRROR(${label}:${uid}) Data Mismatch on ${obj_name}`);
-  console.error(`  d0: ${ret0}`);
-  console.error(`  d1: ${ret1}`);
+  console.error(`  readwrite: ${ret0}`);
+  console.error(`  write-only: ${ret1}`);
 }
 
 DataStoreMirror.prototype.getAsync = function (obj_name, default_value, cb) {
@@ -146,6 +177,6 @@ DataStoreMirror.prototype.getAsyncBuffer = function (obj_name, cb) {
   this.write_ds.getAsyncBuffer(obj_name, wrapped.onDone.bind(wrapped, 1));
 };
 
-export function create(readwrite_ds, write_ds) {
-  return new DataStoreMirror(readwrite_ds, write_ds);
+export function create(options) {
+  return new DataStoreMirror(options);
 }

@@ -1,10 +1,13 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
+export const MAX_SEMANTIC = 5;
+
 const assert = require('assert');
 const engine = require('./engine.js');
+const { errorReportSetDetails, glovErrorReport } = require('./error_report.js');
 const { filewatchOn } = require('./filewatch.js');
-const { matchAll } = require('../../common/util.js');
+const { matchAll } = require('glov/util.js');
 const { texturesUnloadDynamic } = require('./textures.js');
 const { webFSGetFile } = require('./webfs.js');
 
@@ -28,7 +31,7 @@ export const semantic = {
 };
 
 export let globals;
-let defines;
+let global_defines;
 
 let error_fp;
 let error_vp;
@@ -49,46 +52,92 @@ const type_size = {
   mat4: 4*4,
 };
 
-let includes = {};
-
-function loadInclude(key) {
-  let text = webFSGetFile(includes[key].filename, 'text');
-  includes[key].text = `\n// from include "${key}":\n${text}\n`;
+function loadInclude(filename) {
+  let text = webFSGetFile(filename, 'text');
+  return `\n// from include "${filename}":\n${text}\n`;
 }
 
-export function addInclude(key, filename) {
-  assert(!includes[key]);
-  includes[key] = { filename };
-  loadInclude(key);
+export function shadersResetState() {
+  for (let ii = 0; ii < shaders.length; ++ii) {
+    let shader = shaders[ii];
+    if (shader.programs) {
+      for (let fpid in shader.programs) {
+        let prog = shader.programs[fpid];
+        //gl.useProgram(prog.handle);
+        for (let jj = 0; jj < prog.uniforms.length; ++jj) {
+          let unif = prog.uniforms[jj];
+          for (let kk = 0; kk < unif.size; ++kk) {
+            unif.value[kk] = NaN;
+          }
+          //uniformSetValue(unif);
+        }
+      }
+    }
+  }
+  bound_prog = null;
+  gl.useProgram(null);
+}
+
+function setGLErrorReportDetails() {
+  // Set some debug details we might want
+  let details = {
+    max_fragment_uniform_vectors: gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS),
+    max_varying_vectors: gl.getParameter(gl.MAX_VARYING_VECTORS),
+    max_vertex_attribs: gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+    max_vertex_uniform_vectors: gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS),
+    vendor: gl.getParameter(gl.VENDOR),
+    renderer: gl.getParameter(gl.RENDERER),
+    webgl: engine.webgl2 ? 2 : 1,
+  };
+  let debug_info = gl.getExtension('WEBGL_debug_renderer_info');
+  if (debug_info) {
+    details.renderer_unmasked = gl.getParameter(debug_info.UNMASKED_RENDERER_WEBGL);
+    details.vendor_unmasked = gl.getParameter(debug_info.UNMASKED_VENDOR_WEBGL);
+  }
+  for (let key in details) {
+    errorReportSetDetails(key, details[key]);
+  }
 }
 
 let report_queued = false;
 let shader_errors;
-function reportShaderError(err) {
+let shader_errors_any_fatal;
+function reportShaderError(non_fatal, err) {
   function doReport() {
-    assert(false, `Shader error(s):\n    ${shader_errors.join('\n    ')}`);
+    setGLErrorReportDetails();
+    let msg = `Shader error(s):\n    ${shader_errors.join('\n    ')}`;
+    if (!shader_errors_any_fatal) {
+      glovErrorReport(false, msg, 'shaders.js');
+    } else {
+      assert(false, msg);
+    }
     shader_errors = null;
   }
   if (!report_queued) {
     setTimeout(doReport, 1000);
     report_queued = true;
     shader_errors = [];
+    shader_errors_any_fatal = false;
   }
+  shader_errors_any_fatal = shader_errors_any_fatal || !non_fatal;
   shader_errors.push(err);
 }
 
-function parseIncludes(text) {
+function parseIncludes(parent_name, text) {
   let supplied_uniforms = {};
   text.replace(uniform_regex, function (str, key) {
     supplied_uniforms[key] = true;
   });
   text = text.replace(include_regex, function (str, filename) {
-    let replacement = includes[filename];
+    let include_path = parent_name.split('/');
+    include_path.pop();
+    include_path.push(filename);
+    include_path = include_path.join('/');
+    let replacement = loadInclude(include_path);
     if (!replacement) {
       console.error(`Could not evaluate ${str}`);
       return str;
     }
-    replacement = replacement.text;
     // Remove duplicate uniforms
     replacement = replacement.replace(uniform_regex, function (str2, key) {
       if (supplied_uniforms[key]) {
@@ -123,12 +172,15 @@ const webgl2_header_vp = [
 ].join('\n');
 
 function Shader(params) {
-  let { filename } = params;
+  let { filename, defines, non_fatal } = params;
   assert.equal(typeof filename, 'string');
   let type = filename.endsWith('.fp') ? gl.FRAGMENT_SHADER : filename.endsWith('.vp') ? gl.VERTEX_SHADER : 0;
   assert(type);
   this.type = type;
   this.filename = filename;
+  this.non_fatal = non_fatal;
+  this.defines_arr = (defines || []);
+  this.defines = this.defines_arr.map((a) => `#define ${a}\n`).join('');
   this.shader = gl.createShader(type);
   this.id = ++last_id;
   if (type === gl.VERTEX_SHADER) {
@@ -145,8 +197,8 @@ Shader.prototype.compile = function () {
   if (engine.webgl2 && text.indexOf('#pragma WebGL2') !== -1) {
     header = type === gl.VERTEX_SHADER ? webgl2_header_vp : webgl2_header_fp;
   }
-  text = `${header}${defines}${text}`;
-  text = parseIncludes(text);
+  text = `${header}${global_defines}${this.defines}${text}`;
+  text = parseIncludes(filename, text);
   text = text.replace(/#pragma WebGL2?/g, '');
   if (type === gl.VERTEX_SHADER) {
     this.attributes = matchAll(text, vp_attr_regex);
@@ -174,14 +226,20 @@ Shader.prototype.compile = function () {
   gl.compileShader(this.shader);
 
   if (!gl.getShaderParameter(this.shader, gl.COMPILE_STATUS)) {
+    this.valid = false;
     let error_text = gl.getShaderInfoLog(this.shader);
     if (error_text) { // sometimes null on iOS
       error_text = error_text.replace(/\0/g, '').trim();
     }
-    console.error(`Error compiling ${filename}: ${error_text}`);
-    reportShaderError(`${filename}: ${error_text}`);
+    if (this.defines_arr.length) {
+      filename += `(${this.defines_arr.join(',')})`;
+    }
+    console[this.non_fatal ? 'warn' : 'error'](`Error compiling ${filename}: ${error_text}`);
+    reportShaderError(this.non_fatal, `${filename}: ${error_text}`);
     // eslint-disable-next-line newline-per-chained-call
     console.log(text.split('\n').map((line, idx) => `${idx+1}: ${line}`).join('\n'));
+  } else {
+    this.valid = true;
   }
 };
 
@@ -233,7 +291,8 @@ function link(vp, fp) {
 
   prog.valid = gl.getProgramParameter(prog.handle, gl.LINK_STATUS);
   if (!prog.valid) {
-    reportShaderError(`Shader link error (${vp.filename} & ${fp.filename}): ${gl.getProgramInfoLog(prog.handle)}`);
+    reportShaderError(false, `Shader link error (${vp.filename} & ${fp.filename}):` +
+      ` ${gl.getProgramInfoLog(prog.handle)}`);
     console.error(`Shader link error: ${gl.getProgramInfoLog(prog.handle)}`);
   }
 
@@ -335,7 +394,7 @@ export function addReservedDefine(key) {
 }
 let internal_defines = {};
 function applyDefines() {
-  defines = Object.keys(engine.defines).filter((v) => !reserved[v])
+  global_defines = Object.keys(engine.defines).filter((v) => !reserved[v])
     .concat(Object.keys(internal_defines))
     .map((v) => `#define ${v}\n`)
     .join('');
@@ -378,9 +437,6 @@ export function setInternalDefines(new_values) {
 }
 
 function onShaderChange(filename) {
-  for (let key in includes) {
-    loadInclude(key);
-  }
   shaderReload();
 }
 

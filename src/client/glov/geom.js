@@ -3,12 +3,47 @@
 /* eslint no-bitwise:off */
 
 const assert = require('assert');
+const { cmd_parse } = require('./cmds.js');
 const engine = require('./engine.js');
+const perf = require('./perf.js');
+const settings = require('./settings.js');
+const { MAX_SEMANTIC } = require('./shaders.js');
 const { ceil, max, min } = Math;
 
 export const TRIANGLES = 4;
 export const TRIANGLE_FAN = 6;
 export const QUADS = 7;
+
+settings.register({
+  show_render_stats: {
+    default_value: 0,
+    type: cmd_parse.TYPE_INT,
+    range: [0,1],
+  },
+});
+
+export let stats = {
+  draw_calls: 0,
+  draw_calls_geom: 0,
+  draw_calls_sprite: 0,
+  tris: 0,
+  verts: 0,
+  sprites: 0,
+  font_calls: 0,
+  font_params: 0,
+};
+let last_stats = {};
+let perf_labels = {};
+for (let key in stats) {
+  perf_labels[`${key}: `] = () => String(last_stats[key]);
+}
+perf.addMetric({
+  name: 'render_stats',
+  show_stat: 'show_render_stats',
+  show_all: true,
+  labels: perf_labels,
+});
+
 
 const gl_byte_size = {
   0x1400: 1, // GL_BYTE
@@ -216,7 +251,24 @@ function Geom(format, verts, idxs, mode) {
     this.ibo = null;
     this.ibo_owned = false;
   }
+  this.updateTriCount();
 }
+
+function trianglesFromMode(mode, eff_vert_count) {
+  if (mode === TRIANGLES) {
+    return eff_vert_count / 3;
+  } else if (mode === TRIANGLE_FAN) {
+    return eff_vert_count - 2;
+  } else {
+    assert(!eff_vert_count);
+    return 0;
+  }
+}
+
+Geom.prototype.updateTriCount = function () {
+  let eff_vert_count = this.ibo ? this.ibo_size : this.vert_count;
+  this.tri_count = trianglesFromMode(this.mode, eff_vert_count);
+};
 
 Geom.prototype.updateSub = function (offset, verts) {
   if (bound_array_buf !== this.vbo) {
@@ -256,6 +308,7 @@ Geom.prototype.update = function (verts, num_verts) {
     this.ibo = getQuadIndexBuf(quad_count);
     this.ibo_size = quad_count * 6;
   }
+  this.updateTriCount();
 };
 
 Geom.prototype.dispose = function () {
@@ -269,7 +322,6 @@ Geom.prototype.dispose = function () {
   this.vert_gpu_mem = 0;
 };
 
-
 let bound_attribs = (function () {
   let r = [];
   for (let ii = 0; ii < 16; ++ii) {
@@ -280,6 +332,31 @@ let bound_attribs = (function () {
   }
   return r;
 }());
+
+export function geomResetState() {
+  // Resetting this avoids a state management bug on Chrome 71-73 on Redmi 6A -
+  //   it seems the browser was leaving something bound at a low level, perhaps
+  //   from generating mipmaps or something?
+  bound_geom = null;
+  bound_index_buf = null;
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+  bound_array_buf = null;
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  for (let ii = 0; ii < MAX_SEMANTIC; ++ii) {
+    gl.disableVertexAttribArray(ii);
+  }
+  attrib_enabled = 0;
+  for (let ii = 0; ii < bound_attribs.length; ++ii) {
+    bound_attribs[ii].vbo = null;
+  }
+  // Also resetting stats for metrics here, but could do that separately if needed
+  stats.draw_calls = stats.draw_calls_geom + stats.draw_calls_sprite;
+  for (let key in stats) {
+    last_stats[key] = stats[key];
+    stats[key] = 0;
+  }
+}
+
 Geom.prototype.bind = function () {
   if (bound_geom !== this) {
     bound_geom = this;
@@ -290,19 +367,19 @@ Geom.prototype.bind = function () {
       let fmt = this.format[ii];
       let count = fmt[2];
       let byte_size = fmt[4];
-      if (bound_attribs[ii].vbo === vbo) { //  && bound_attribs[ii].offset = offset
+      let sem = fmt[0];
+      if (bound_attribs[sem].vbo === vbo) { //  && bound_attribs[sem].offset = offset
         // already bound
       } else {
         if (bound_array_buf !== vbo) {
           gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
           bound_array_buf = vbo;
         }
-        let sem = fmt[0];
         let gltype = fmt[1];
         let normalized = fmt[3];
         gl.vertexAttribPointer(sem, count, gltype, normalized, this.stride, offset);
-        bound_attribs[ii].vbo = bound_array_buf;
-        // bound_attribs[ii].offset = offset;
+        bound_attribs[sem].vbo = bound_array_buf;
+        // bound_attribs[sem].offset = offset;
       }
       offset += count * byte_size;
     }
@@ -320,10 +397,25 @@ Geom.prototype.bind = function () {
 };
 Geom.prototype.draw = function () {
   this.bind();
+  ++stats.draw_calls_geom;
+  stats.tris += this.tri_count;
+  stats.verts += this.vert_count;
   if (this.ibo) {
     gl.drawElements(this.mode, this.ibo_size, gl.UNSIGNED_SHORT, 0);
   } else {
     gl.drawArrays(this.mode, 0, this.vert_count);
+  }
+};
+Geom.prototype.drawSub = function (start, tri_count) {
+  assert.equal(this.mode, TRIANGLES);
+  this.bind();
+  ++stats.draw_calls_geom;
+  if (this.ibo) {
+    stats.tris += tri_count;
+    stats.verts += tri_count*2; // assumes quads
+    gl.drawElements(this.mode, tri_count * 3, gl.UNSIGNED_SHORT, start * 2);
+  } else {
+    gl.drawArrays(this.mode, start, tri_count * 3);
   }
 };
 
@@ -354,9 +446,9 @@ export function create(format, verts, idxs, mode) {
   return new Geom(format, verts, idxs, mode);
 }
 
-export function createQuads(format, verts) {
+export function createQuads(format, verts, fixed_size) {
   let format_info = formatInfo(format);
-  assert(verts instanceof Uint8Array); // only one handled by GeomMultiQuads for now
+  assert(fixed_size || verts instanceof Uint8Array); // only one handled by GeomMultiQuads for now
   let vert_count = verts.length / format_info.elem_count;
   if (vert_count > 65536) {
     return new GeomMultiQuads(format, verts);

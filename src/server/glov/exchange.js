@@ -2,7 +2,7 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 
 const assert = require('assert');
-const { isPacket, packetFromBuffer } = require('../../common/packet.js');
+const { isPacket, packetFromBuffer } = require('glov/packet.js');
 
 export const ERR_NOT_FOUND = 'ERR_NOT_FOUND';
 
@@ -39,9 +39,15 @@ export function subscribe(id, cb) {
   broadcasts[id].push(cb);
 }
 
-export function unregister(id) {
+export function unregister(id, cb) {
   assert(queues[id]);
-  delete queues[id];
+  process.nextTick(function () {
+    assert(queues[id]);
+    delete queues[id];
+    if (cb) {
+      cb();
+    }
+  });
 }
 
 // pak and it's buffers are valid until cb() is called

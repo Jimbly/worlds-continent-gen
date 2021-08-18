@@ -12,8 +12,9 @@ const in_event = require('./in_event.js');
 const local_storage = require('./local_storage.js');
 const { abs, max, min, sqrt } = Math;
 const pointer_lock = require('./pointer_lock.js');
+const settings = require('./settings.js');
 const { soundResume } = require('./sound.js');
-const { vec2, v2add, v2copy, v2lengthSq, v2set, v2scale, v2sub } = require('./vmath.js');
+const { vec2, v2add, v2copy, v2lengthSq, v2set, v2scale, v2sub } = require('glov/vmath.js');
 
 const UP_EDGE = 0; // only for pads, which use === null as "up"
 const UP = 0; // only for key/mouse
@@ -51,7 +52,9 @@ export let KEYS = {
   DEL: 46,
   NUMPAD_DIVIDE: 111,
   EQUALS: 187,
+  COMMA: 188,
   MINUS: 189,
+  PERIOD: 190,
   SLASH: 191,
   TILDE: 192,
 };
@@ -123,7 +126,7 @@ let input_eaten_mouse = false;
 let touches = {}; // `m${button}` or touch_id -> TouchData
 
 export let touch_mode = local_storage.getJSON('touch_mode', false);
-export let pad_mode = local_storage.getJSON('pad_mode', false);
+export let pad_mode = !touch_mode && local_storage.getJSON('pad_mode', false);
 
 cmd_parse.registerValue('mouse_log', {
   type: cmd_parse.TYPE_INT,
@@ -155,6 +158,7 @@ function TouchData(pos, touch, button, event) {
   this.dispatched = false;
   this.dispatched_drag = false;
   this.dispatched_drag_over = false;
+  this.was_double_click = false;
   this.up_edge = 0;
   this.down_edge = 0;
   this.state = DOWN;
@@ -247,7 +251,8 @@ function eventlog(event) {
 }
 
 function letEventThrough(event) {
-  return event.target.tagName === 'INPUT' || String(event.target.className).indexOf('noglov') !== -1;
+  return event.target && (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA' ||
+    event.target.tagName === 'LABEL' || String(event.target.className).indexOf('noglov') !== -1);
 }
 
 function ignored(event) {
@@ -258,9 +263,12 @@ function ignored(event) {
   }
 }
 
+let ctrl_checked = false;
 let unload_protected = false;
 function beforeUnload(e) {
-  if (unload_protected) {
+  if (unload_protected && ctrl_checked) {
+    // Exit pointer lock if the browser didn't do that automatically
+    pointerLockExit();
     // Cancel the event
     e.preventDefault();
     // Chrome requires returnValue to be set
@@ -271,6 +279,15 @@ function beforeUnload(e) {
 }
 function protectUnload(enable) {
   unload_protected = enable;
+}
+
+let last_input_time = 0;
+export function inputLastTime() {
+  return last_input_time;
+}
+function onUserInput() {
+  soundResume();
+  last_input_time = Date.now();
 }
 
 function onKeyUp(event) {
@@ -299,13 +316,14 @@ function onKeyDown(event) {
   let code = event.keyCode;
   let no_stop = letEventThrough(event) ||
     code >= KEYS.F5 && code <= KEYS.F12 || // Chrome debug hotkeys
-    code === KEYS.I && (event.altKey && event.metaKey || event.ctrlKey && event.shiftKey); // Safari, alternate Chrome
+    code === KEYS.I && (event.altKey && event.metaKey || event.ctrlKey && event.shiftKey) || // Safari, alternate Chrome
+    code === KEYS.R && event.ctrlKey; // Chrome reload hotkey
   if (!no_stop) {
     event.stopPropagation();
     event.preventDefault();
   }
   // console.log(`${event.code} ${event.keyCode}`);
-  soundResume();
+  onUserInput();
 
   // Letting through to our code regardless of no_stop, because we handle things like ESC in INPUT elements
   let ks = key_state_new[code];
@@ -330,6 +348,7 @@ export function debugGetMouseMoveX() {
 }
 
 let mouse_moved = false;
+let mouse_button_had_edge = false;
 let temp_delta = vec2();
 let last_abs_move = 0;
 let last_abs_move_time = 0;
@@ -415,7 +434,7 @@ function onMouseDown(event) {
     eventlog(event);
   }
   onMouseMove(event); // update mouse_pos
-  soundResume();
+  onUserInput();
   let no_click = letEventThrough(event);
 
   let button = event.button;
@@ -430,10 +449,27 @@ function onMouseDown(event) {
   if (!no_click) {
     in_event.handle('mousedown', event);
   }
+  mouse_button_had_edge = true;
   //This solves input bug when game is running as iframe. E.g. Facebook Instant
   if (window.focus) {
     window.focus();
   }
+}
+
+let last_up_edges = [{
+  timestamp: 0,
+  pos: vec2(),
+},{
+  timestamp: 0,
+  pos: vec2(),
+}];
+function registerMouseUpEdge(touch_data, timestamp) {
+  touch_data.up_edge++;
+  let t = last_up_edges[0];
+  last_up_edges[0] = last_up_edges[1];
+  last_up_edges[1] = t;
+  v2copy(t.pos, touch_data.cur_pos);
+  t.timestamp = timestamp;
 }
 
 function onMouseUp(event) {
@@ -449,13 +485,14 @@ function onMouseUp(event) {
     if (touch_data) {
       v2copy(touch_data.cur_pos, mouse_pos);
       if (!no_click) {
-        touch_data.up_edge++;
+        registerMouseUpEdge(touch_data, eventTimestamp(event));
       }
       touch_data.state = UP;
       touch_data.down_time += timeDelta(event, touch_data.origin_time);
     }
     delete mouse_down[button];
   }
+  mouse_button_had_edge = true;
   if (!no_click) {
     in_event.handle('mouseup', event);
   }
@@ -478,14 +515,14 @@ function onTouchChange(event) {
   // Using .pageX/Y here because on iOS when a text entry is selected, it scrolls
   // our canvas offscreen.  Should maybe have the canvas resize and use clientX
   // instead, but this works well enough.
-  soundResume();
+  onUserInput();
   if (!touch_mode) {
     local_storage.set('touch_mode', true);
     touch_mode = true;
   }
   if (pad_mode) {
-    local_storage.set('pad_mode', true);
-    pad_mode = true;
+    local_storage.set('pad_mode', false);
+    pad_mode = false;
   }
   if (event.cancelable !== false) {
     event.preventDefault();
@@ -498,6 +535,16 @@ function onTouchChange(event) {
   // Look for press and movement
   for (let ii = 0; ii < new_count; ++ii) {
     let touch = ct[ii];
+    try {
+      if (!isFinite(touch.pageX) || !isFinite(touch.pageY)) {
+        // getting bad touch events sometimes (Moto phones?), simply ignore
+        continue;
+      }
+    } catch (e) {
+      // getting "Permission denied to access property "pageX" rarely on Firefox, simply ignore
+      continue;
+    }
+
     let last_touch = touches[touch.identifier];
     v2set(touch_pos, touch.pageX, touch.pageY);
     if (!last_touch) {
@@ -530,7 +577,7 @@ function onTouchChange(event) {
         released_touch = touch;
         released_ids.push(id);
         in_event.handle('mouseup', { pageX: touch.cur_pos[0], pageY: touch.cur_pos[1] });
-        touch.up_edge++;
+        registerMouseUpEdge(touch, eventTimestamp(event));
         touch.state = UP;
         touch.down_time += timeDelta(event, touch.origin_time);
         touch.release = true;
@@ -619,6 +666,7 @@ export function startup(_canvas, params) {
   window.addEventListener('keyup', onKeyUp, false);
 
   window.addEventListener('click', ignored, false);
+  //window.addEventListener('click', eventlog, false);
   window.addEventListener('contextmenu', ignored, false);
   window.addEventListener('mousemove', onMouseMove, false);
   window.addEventListener('mousedown', onMouseDown, false);
@@ -666,6 +714,10 @@ function getGamepadData(idx) {
 function updatePadState(gpd, ps, b, padcode) {
   if (b && !ps[padcode]) {
     ps[padcode] = DOWN_EDGE;
+    if (touch_mode) {
+      local_storage.set('touch_mode', false);
+      touch_mode = false;
+    }
     if (!pad_mode) {
       local_storage.setJSON('pad_mode', true);
       pad_mode = true;
@@ -688,7 +740,7 @@ function updatePadState(gpd, ps, b, padcode) {
       if (touch_data) {
         setMouseToMid();
         v2copy(touch_data.cur_pos, mouse_pos);
-        touch_data.up_edge++;
+        registerMouseUpEdge(touch_data, engine.hrtime);
         touch_data.state = UP;
         touch_data.down_time += max(engine.hrtime - touch_data.origin_time, MIN_EVENT_TIME_DELTA);
       }
@@ -774,6 +826,21 @@ function gamepadUpdate() {
   }
 }
 
+export function fakeTouchEvent(is_down) {
+  const touch_id = 'faketouch';
+  let touch_data = touches[touch_id];
+  if (touch_data && !is_down) {
+    setMouseToMid();
+    v2copy(touch_data.cur_pos, mouse_pos);
+    registerMouseUpEdge(touch_data, engine.hrtime);
+    touch_data.state = UP;
+    touch_data.down_time += max(engine.hrtime - touch_data.origin_time, MIN_EVENT_TIME_DELTA);
+  } else if (!touch_data && is_down) {
+    setMouseToMid();
+    touches[touch_id] = new TouchData(mouse_pos, false, 0, null);
+  }
+}
+
 export function tickInput() {
   // browser frame has occurred since the call to endFrame(),
   // we should now have `touches` and `key_state` populated with edge events
@@ -804,6 +871,7 @@ export function tickInput() {
   mouse_over_captured = false;
   gamepadUpdate();
   in_event.topOfFrame();
+  ctrl_checked = false;
   if (touches[pointerlock_touch_id] && !pointerLocked()) {
     pointerLockExit();
   }
@@ -860,6 +928,13 @@ export function endFrame(skip_mouse) {
   }
   input_eaten_kb = false;
   mouse_moved = false;
+  mouse_button_had_edge = false;
+}
+
+export function tickInputInactive() {
+  in_event.topOfFrame();
+  ctrl_checked = false;
+  endFrame();
 }
 
 export function eatAllInput(skip_mouse) {
@@ -887,6 +962,10 @@ export function mouseMoved() {
   return mouse_moved;
 }
 
+export function mouseButtonHadEdge() {
+  return mouse_button_had_edge;
+}
+
 function mousePosParam(param) {
   param = param || {};
   return {
@@ -905,6 +984,13 @@ function checkPos(pos, param) {
   }
   return check_pos[0] >= param.x && (param.w === Infinity || check_pos[0] < param.x + param.w) &&
     check_pos[1] >= param.y && (param.h === Infinity || check_pos[1] < param.y + param.h);
+}
+
+function wasDoubleClick(pos_param) {
+  if (engine.hrtime - last_up_edges[0].timestamp > settings.double_click_time) {
+    return false;
+  }
+  return checkPos(last_up_edges[0].pos, pos_param);
 }
 
 export function mouseWheel(param) {
@@ -927,8 +1013,12 @@ export function mouseWheel(param) {
   return ret;
 }
 
+export function mouseOverCaptured() {
+  mouse_over_captured = true;
+}
+
 export function mouseOver(param) {
-  if (mouse_over_captured || pointerLocked()) {
+  if (mouse_over_captured || pointerLocked() && !(param && param.allow_pointerlock)) {
     return false;
   }
   param = param || {};
@@ -999,6 +1089,9 @@ export function numTouches() {
 }
 
 export function keyDown(keycode) {
+  if (keycode === KEYS.CTRL) {
+    ctrl_checked = true;
+  }
   if (input_eaten_kb) {
     return 0;
   }
@@ -1062,14 +1155,14 @@ function padButtonDownInternal(gpd, ps, padcode) {
 function padButtonDownEdgeInternal(gpd, ps, padcode) {
   if (ps[padcode] === DOWN_EDGE) {
     ps[padcode] = DOWN;
-    return engine.frame_dt;
+    return 1;
   }
   return 0;
 }
 function padButtonUpEdgeInternal(gpd, ps, padcode) {
   if (ps[padcode] === UP_EDGE) {
     delete ps[padcode];
-    return engine.frame_dt;
+    return 1;
   }
   return 0;
 }
@@ -1117,15 +1210,19 @@ export function mouseUpEdge(param) {
   let pos_param = mousePosParam(param);
   let button = pos_param.button;
   let max_click_dist = param.max_dist || 50; // TODO: relative to camera distance?
+  let dragged_too_far = false;
 
   for (let touch_id in touches) {
     let touch_data = touches[touch_id];
+    if (touch_data.total > max_click_dist) {
+      // Do *not* register in_event_cb, would fire even when we would disregard this click
+      dragged_too_far = true;
+      continue;
+    }
     if (!touch_data.up_edge) {
       continue;
     }
-    if (!(button === ANY || button === touch_data.button) ||
-      touch_data.total > max_click_dist
-    ) {
+    if (!(button === ANY || button === touch_data.button)) {
       continue;
     }
     if (checkPos(touch_data.cur_pos, pos_param)) {
@@ -1136,11 +1233,12 @@ export function mouseUpEdge(param) {
         button: touch_data.button,
         pos: check_pos.slice(0),
         start_time: touch_data.start_time,
+        was_double_click: wasDoubleClick(pos_param),
       };
     }
   }
 
-  if (param.in_event_cb && !input_eaten_mouse && !mouse_over_captured) {
+  if (param.in_event_cb && !input_eaten_mouse && !mouse_over_captured && !dragged_too_far) {
     // TODO: Maybe need to also pass along earlier exclusions?  Working okay for now though.
     if (!param.phys) {
       param.phys = {};

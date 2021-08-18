@@ -1,13 +1,13 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
-const assert = require('assert');
 const { cmd_parse } = require('./cmds.js');
 const glov_engine = require('./engine.js');
 const net = require('./net.js');
 const perf = require('./perf.js');
 const settings = require('./settings.js');
-const util = require('../../common/util.js');
+const util = require('glov/util.js');
+const { wsstats, wsstats_out } = require('glov/wscommon.js');
 const { abs, floor, max, min, PI, sqrt } = Math;
 const TWO_PI = PI * 2;
 const EPSILON = 0.01;
@@ -25,7 +25,7 @@ perf.addMetric({
   name: 'ping',
   show_stat: 'show_ping',
   labels: {
-    'net: ': () => {
+    'ping: ': () => {
       if (!the) {
         return '';
       }
@@ -37,10 +37,43 @@ perf.addMetric({
     },
   },
 });
+settings.register({
+  show_net: {
+    default_value: 0,
+    type: cmd_parse.TYPE_INT,
+    range: [0,2],
+  },
+});
+let last_wsstats = { msgs: 0, bytes: 0, time: Date.now(), dm: 0, db: 0 };
+let last_wsstats_out = { msgs: 0, bytes: 0, time: Date.now(), dm: 0, db: 0 };
+function bandwidth(stats, last) {
+  let now = Date.now();
+  if (now - last.time > 1000) {
+    last.dm = stats.msgs - last.msgs;
+    last.db = stats.bytes - last.bytes;
+    last.msgs = stats.msgs;
+    last.bytes = stats.bytes;
+    if (now - last.time > 2000) { // stall
+      last.time = now;
+    } else {
+      last.time += 1000;
+    }
+  }
+  return `${(last.db/1024).toFixed(2)} kb (${last.dm})`;
+}
+perf.addMetric({
+  name: 'net',
+  show_stat: 'show_net',
+  width: 5,
+  labels: {
+    'down: ': bandwidth.bind(null, wsstats, last_wsstats),
+    'up: ': bandwidth.bind(null, wsstats_out, last_wsstats_out),
+  },
+});
 
 const valid_options = [
   // Numeric parameters
-  'n', 'dim_pos', 'dim_rot', // dimensions
+  'dim_pos', 'dim_rot', // dimensions
   'send_time', 'window', 'snap_factor', 'smooth_windows', 'smooth_factor', 'default_pos',
   // Callbacks
   'on_pos_update', 'on_state_update',
@@ -174,7 +207,7 @@ NetPositionManager.prototype.reinit = function (options) {
     }
   }
 
-  assert.equal(this.dim_pos + this.dim_rot, this.n);
+  this.n = this.dim_pos + this.dim_rot;
 
   if (!this.default_pos) {
     this.default_pos = this.vec();
@@ -421,7 +454,7 @@ NetPositionManager.prototype.updateOtherClient = function (client_id, dt) {
   }
   return pcd;
 };
-NetPositionManager.prototype.n = 2; // dimensionality of position vectors
+
 NetPositionManager.prototype.dim_pos = 2; // number of components to be interpolated as-is
 NetPositionManager.prototype.dim_rot = 0; // number of components to be interpolated with 2PI wrapping
 NetPositionManager.prototype.send_time = 200; // how often to send position updates

@@ -1,7 +1,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 // Code provided for example purposes only with no license for use or distribution
 const assert = require('assert');
-const { packetCreate, packetFromBuffer, PACKET_DEBUG } = require('../common/packet.js');
+const { packetCreate, packetFromBuffer, PACKET_DEBUG } = require('glov/packet.js');
 
 const CONTINENT_SER_VERSION = 1;
 

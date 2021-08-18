@@ -6,12 +6,12 @@ const assert = require('assert');
 const { abs, atan2, ceil, cos, max, min, floor, round, pow, sin, sqrt, PI } = Math;
 const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS, SKEW_X,
   C_RIVER_DELTA } = require('./proc_gen_constants.js');
-const { randCreate } = require('./glov/rand_alea.js');
+const { randCreate } = require('glov/rand_alea.js');
 const SimplexNoise = require('simplex-noise');
-const { clamp, lerp, ridx } = require('../common/util.js');
+const { clamp, lerp, ridx } = require('glov/util.js');
 const {
   vec2, v2copy, v2lengthSq,
-} = require('./glov/vmath.js');
+} = require('glov/vmath.js');
 
 const default_tex_size = 256;
 

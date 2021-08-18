@@ -24,9 +24,9 @@ exports.default_flags = 0;
 
 const assert = require('assert');
 const { max } = Math;
-const { isInteger, log2 } = require('../common/util.js');
-// const { isInteger, log2 } = require('../../build.dev/common/util.js');
-const { base64Encode, base64Decode } = require('../common/base64.js');
+const { isInteger, log2 } = require('./util.js');
+// const { isInteger, log2 } = require('../../build.dev/common/glov/util.js');
+const { base64Encode, base64Decode } = require('./base64.js');
 
 const FALSYS = [undefined, null, 0, false, '', NaN];
 const PAK_BUF_DEFAULT_SIZE = 1024;
@@ -194,6 +194,7 @@ Packet.prototype.reinit = function (flags, init_size, pak_debug) {
   }
 };
 Packet.prototype.ref = function () {
+  assert(this.ref_count); // must not already be pooled!
   ++this.ref_count;
 };
 Packet.prototype.pool = function () {
@@ -259,7 +260,7 @@ Packet.prototype.makeReadable = function () {
   for (let ii = 0; ii < this.bufs.length; ++ii) {
     let bsize = this.bsizes[ii];
     let dv = this.bufs[ii];
-    if (offs + bsize > total) {
+    if (offs + dv.u8.length > total) {
       // unused portion would overrun
       assert.equal(dv.byteOffset, 0);
       u8.set(new Uint8Array(dv.buffer, 0, bsize), offs);
@@ -575,6 +576,9 @@ Packet.prototype.writeAnsiString = function (v) {
 };
 Packet.prototype.readAnsiString = function () {
   let len = this.readInt();
+  if (!len) {
+    return '';
+  }
   let offs = this.advance(len);
   let { buf } = this;
   string_assembly.length = len;
@@ -885,8 +889,11 @@ PacketDebug.prototype.contents = function () {
     read_len = -1;
   }
   let saved_ref_count = pak.ref_count;
-  pak.ref(); // prevent auto pooling
+  pak.ref_count = 2; // prevent auto pooling, don't assert on ref() if unref'd.
   try {
+    if (!saved_ref_count) {
+      ret.push('!ref_count=0!');
+    }
     if (pak.has_flags) {
       ret.push(`flags:${pak.readU8()}`);
     }

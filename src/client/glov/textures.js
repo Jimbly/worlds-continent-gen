@@ -6,8 +6,9 @@ const assert = require('assert');
 const engine = require('./engine.js');
 const { filewatchOn } = require('./filewatch.js');
 const local_storage = require('./local_storage.js');
+const settings = require('./settings.js');
 const urlhash = require('./urlhash.js');
-const { callEach, isPowerOfTwo, nextHighestPowerOfTwo, ridx } = require('../../common/util.js');
+const { callEach, isPowerOfTwo, nextHighestPowerOfTwo, ridx } = require('glov/util.js');
 
 const TEX_UNLOAD_TIME = 5 * 60 * 1000; // for textures loaded (each frame) with auto_unload: true
 
@@ -33,6 +34,8 @@ export const format = {
   R8: { count: 1 },
   RGB8: { count: 3 },
   RGBA8: { count: 4 },
+  DEPTH16: { count: 1 },
+  DEPTH24: { count: 1 },
 };
 
 export function defaultFilters(min, mag) {
@@ -105,6 +108,17 @@ export function isArrayBound(texs) {
   return true;
 }
 
+export function texturesResetState() {
+  bound_unit = -1;
+  if (engine.webgl2) {
+    unbindAll(gl.TEXTURE_2D_ARRAY);
+  }
+  unbindAll(gl.TEXTURE_2D);
+  setUnit(0);
+  gl.getError();
+}
+
+
 let auto_unload_textures = [];
 
 function Texture(params) {
@@ -133,7 +147,9 @@ function Texture(params) {
 
   if (params.data) {
     let err = this.updateData(params.width, params.height, params.data);
-    assert(!err, err);
+    if (err) {
+      assert(false, `Error loading ${params.name}: GLError(${err})`);
+    }
   } else {
     // texture is not valid, do not leave bound
     unbindAll(this.target);
@@ -154,11 +170,16 @@ Texture.prototype.updateGPUMem = function () {
   this.gpu_mem = diff;
 };
 
-Texture.prototype.setSamplerState = function (params) {
-  let target = this.target;
+function bindForced(tex) {
+  let target = tex.target;
   setUnit(0);
   bound_tex[0] = null; // Force a re-bind, no matter what
-  bindHandle(0, target, this.handle);
+  bindHandle(0, target, tex.handle);
+}
+
+Texture.prototype.setSamplerState = function (params) {
+  let target = this.target;
+  bindForced(this);
 
   this.filter_min = params.filter_min || default_filter_min;
   this.filter_mag = params.filter_mag || default_filter_mag;
@@ -169,7 +190,8 @@ Texture.prototype.setSamplerState = function (params) {
   gl.texParameteri(target, gl.TEXTURE_WRAP_S, this.wrap_s);
   gl.texParameteri(target, gl.TEXTURE_WRAP_T, this.wrap_t);
 
-  this.mipmaps = this.filter_min >= 0x2700 && this.filter_min <= 0x2703; // Probably gl.LINEAR_MIPMAP_LINEAR
+  this.mipmaps = this.filter_min >= 0x2700 && this.filter_min <= 0x2703 || // Probably gl.LINEAR_MIPMAP_LINEAR
+    params.force_mipmaps;
 
   if (max_aniso) {
     if (this.mipmaps && params.filter_mag !== gl.NEAREST) {
@@ -182,15 +204,14 @@ Texture.prototype.setSamplerState = function (params) {
 
 Texture.prototype.updateData = function updateData(w, h, data) {
   assert(!this.destroyed);
-  setUnit(0);
-  bound_tex[0] = null; // Force a re-bind, no matter what
-  bindHandle(0, this.target, this.handle);
+  bindForced(this);
   this.last_use = frame_timestamp;
   this.src_width = w;
   this.src_height = h;
   this.width = w;
   this.height = h;
-  gl.getError(); // clear the error flag if there is one
+  // clear the error flag(s) if there are any
+  for (let ii = 0; ii < 10 && gl.getError(); ++ii); // eslint-disable-line curly
   // Resize NP2 if this is not being used for a texture array, and it is not explicitly allowed (non-mipmapped, wrapped)
   let np2 = (!isPowerOfTwo(w) || !isPowerOfTwo(h)) && !this.is_array && !this.is_cube &&
     !(!this.mipmaps && this.wrap_s === gl.CLAMP_TO_EDGE && this.wrap_t === gl.CLAMP_TO_EDGE);
@@ -270,7 +291,10 @@ Texture.prototype.updateData = function updateData(w, h, data) {
   }
   if (this.mipmaps) {
     gl.generateMipmap(this.target);
-    assert(!gl.getError());
+    gl_err = gl.getError();
+    if (gl_err) {
+      return gl_err;
+    }
   }
   this.updateGPUMem();
   this.eff_handle = this.handle;
@@ -371,7 +395,8 @@ Texture.prototype.loadURL = function loadURL(url, filter) {
         return;
       }
     }
-    let err = `Error loading texture "${url}"${err_details}`;
+    let err_url = url && url.length > 100 ? `${url.slice(0, 100)}...` : url;
+    let err = `Error loading texture "${err_url}"${err_details}`;
     retries++;
     if (retries > TEX_RETRY_COUNT) {
       --load_count;
@@ -389,6 +414,58 @@ Texture.prototype.loadURL = function loadURL(url, filter) {
     setTimeout(tryLoad.bind(null, handleLoad), 100 * retries * retries);
   }
   tryLoad(handleLoad);
+};
+
+Texture.prototype.allocFBO = function (w, h) {
+  const fbo_format = settings.fbo_rgba ? gl.RGBA : gl.RGB;
+  bindForced(this);
+  gl.texImage2D(this.target, 0, fbo_format, w, h, 0, fbo_format, gl.UNSIGNED_BYTE, null);
+
+  this.fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.handle, 0);
+
+  this.last_use = frame_timestamp;
+  this.src_width = this.width = w;
+  this.src_height = this.height = h;
+  this.updateGPUMem();
+};
+
+Texture.prototype.allocDepth = function (w, h) {
+  bindForced(this);
+  gl.texImage2D(gl.TEXTURE_2D, 0, this.format.internal_type,
+    w, h, 0, this.format.format, this.format.gl_type, null);
+
+  this.last_use = frame_timestamp;
+  this.src_width = this.width = w;
+  this.src_height = this.height = h;
+  this.updateGPUMem();
+};
+
+Texture.prototype.captureStart = function (w, h) {
+  assert(!this.capture);
+  this.capture = { w, h };
+  if (this.fbo) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+  }
+};
+
+Texture.prototype.captureEnd = function (filter_linear, wrap) {
+  assert(this.capture);
+  let capture = this.capture;
+  this.capture = null;
+  if (this.fbo) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  } else {
+    this.copyTexImage(0, 0, capture.w, capture.h);
+  }
+  let filter = filter_linear ? gl.LINEAR : gl.NEAREST;
+  this.setSamplerState({
+    filter_min: filter,
+    filter_mag: filter,
+    wrap_s: wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE,
+    wrap_t: wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE,
+  });
 };
 
 Texture.prototype.copyTexImage = function (x, y, w, h) {
@@ -417,6 +494,10 @@ Texture.prototype.destroy = function () {
   delete textures[this.name];
   unbindAll(this.target);
   gl.deleteTexture(this.handle);
+  if (this.fbo) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(this.fbo);
+  }
   this.width = this.height = 0;
   this.updateGPUMem();
   this.destroyed = true;
@@ -444,6 +525,22 @@ export function createForCapture(unique_name, auto_unload) {
     format: format.RGB8,
     name,
     auto_unload,
+  });
+  texture.loaded = true;
+  texture.eff_handle = texture.handle;
+  return texture;
+}
+
+export function createForDepthCapture(unique_name, tex_format) {
+  let name = unique_name || `screen_temporary_tex_${++last_temporary_id}`;
+  assert(!textures[name]);
+  let texture = create({
+    filter_min: gl.NEAREST,
+    filter_mag: gl.NEAREST,
+    wrap_s: gl.CLAMP_TO_EDGE,
+    wrap_t: gl.CLAMP_TO_EDGE,
+    format: tex_format,
+    name,
   });
   texture.loaded = true;
   texture.eff_handle = texture.handle;
@@ -518,6 +615,11 @@ function textureReload(filename) {
   return false;
 }
 
+let depth_supported;
+export function textureSupportsDepth() {
+  return depth_supported;
+}
+
 export function startup() {
 
   default_filter_min = gl.LINEAR_MIPMAP_LINEAR;
@@ -529,6 +631,26 @@ export function startup() {
   format.RGB8.gl_type = gl.UNSIGNED_BYTE;
   format.RGBA8.internal_type = gl.RGBA;
   format.RGBA8.gl_type = gl.UNSIGNED_BYTE;
+
+  let UNSIGNED_INT_24_8;
+  if (engine.webgl2) {
+    depth_supported = true;
+    UNSIGNED_INT_24_8 = gl.UNSIGNED_INT_24_8;
+  } else {
+    let ext = gl.getExtension('WEBGL_depth_texture');
+    if (ext) {
+      UNSIGNED_INT_24_8 = ext.UNSIGNED_INT_24_8_WEBGL;
+      depth_supported = true;
+    }
+  }
+  if (depth_supported) {
+    format.DEPTH16.internal_type = engine.webgl2 ? gl.DEPTH_COMPONENT16 : gl.DEPTH_COMPONENT;
+    format.DEPTH16.format = gl.DEPTH_COMPONENT;
+    format.DEPTH16.gl_type = gl.UNSIGNED_SHORT;
+    format.DEPTH24.internal_type = engine.webgl2 ? gl.DEPTH24_STENCIL8 : gl.DEPTH_STENCIL;
+    format.DEPTH24.format = gl.DEPTH_STENCIL;
+    format.DEPTH24.gl_type = UNSIGNED_INT_24_8;
+  }
 
   let ext_anisotropic = (
     gl.getExtension('EXT_texture_filter_anisotropic') ||

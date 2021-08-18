@@ -2,28 +2,37 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 
 const assert = require('assert');
+const {
+  chunkedReceiverFinish,
+  chunkedReceiverInit,
+  chunkedReceiverOnChunk,
+  chunkedReceiverStart,
+  chunkedReceiverFreeFile,
+  chunkedReceiverGetFile,
+} = require('glov/chunked_send.js');
 const dot_prop = require('dot-prop');
-const EventEmitter = require('../../common/tiny-events.js');
-const fbinstant = require('./fbinstant.js');
+const EventEmitter = require('glov/tiny-events.js');
+const { fbGetLoginInfo } = require('./fbinstant.js');
 const local_storage = require('./local_storage.js');
-const md5 = require('../../common/md5.js');
-const { isPacket } = require('../../common/packet.js');
-const util = require('../../common/util.js');
+const md5 = require('glov/md5.js');
+const { isPacket } = require('glov/packet.js');
+const util = require('glov/util.js');
+const walltime = require('./walltime.js');
 
 // relevant events:
 //   .on('channel_data', cb(data [, mod_key, mod_value]));
 
-function ClientChannelWorker(subs, channel_id) {
+function ClientChannelWorker(subs, channel_id, base_handlers) {
   EventEmitter.call(this);
   this.subs = subs;
   this.channel_id = channel_id;
   this.subscriptions = 0;
   this.subscribe_failed = false;
   this.got_subscribe = false;
-  this.handlers = {};
+  this.immediate_subscribe = 0;
+  this.channel_data_ver = 0; // for polling for changes
+  this.handlers = Object.create(base_handlers);
   this.data = {};
-  this.onMsg('channel_data', this.handleChannelData.bind(this));
-  this.onMsg('apply_channel_data', this.handleApplyChannelData.bind(this));
 }
 util.inherits(ClientChannelWorker, EventEmitter);
 
@@ -50,22 +59,22 @@ ClientChannelWorker.prototype.onceSubscribe = function (cb) {
 ClientChannelWorker.prototype.handleChannelData = function (data, resp_func) {
   console.log(`got channel_data(${this.channel_id}):  ${JSON.stringify(data)}`);
   this.data = data;
+  ++this.channel_data_ver;
   this.emit('channel_data', this.data);
   this.got_subscribe = true;
   this.emit('subscribe', this.data);
 
   // Get command list upon first connect
   let channel_type = this.channel_id.split('.')[0];
-  let cmd_list = this.subs.cmds_list_by_worker;
+  let cmd_list = this.subs.cmds_fetched_by_type;
   if (cmd_list && !cmd_list[channel_type]) {
-    cmd_list[channel_type] = {};
+    cmd_list[channel_type] = true;
     this.send('cmdparse', 'cmd_list', (err, resp) => {
       if (err) { // already unsubscribed?
         console.error(`Error getting cmd_list for ${channel_type}`);
         delete cmd_list[channel_type];
-      } else if (resp.found) {
-        cmd_list[channel_type] = resp;
-        this.subs.cmd_parse.addServerCommands(resp.resp);
+      } else {
+        this.subs.cmd_parse.addServerCommands(resp);
       }
     });
   }
@@ -83,6 +92,7 @@ ClientChannelWorker.prototype.handleApplyChannelData = function (data, resp_func
   } else {
     dot_prop.set(this.data, data.key, data.value);
   }
+  ++this.channel_data_ver;
   this.emit('channel_data', this.data, data.key, data.value);
   resp_func();
 };
@@ -96,7 +106,7 @@ ClientChannelWorker.prototype.setChannelData = function (key, value, skip_predic
     dot_prop.set(this.data, key, value);
   }
   let q = value && value.q || undefined;
-  let pak = this.subs.client.wsPak('set_channel_data');
+  let pak = this.subs.client.pak('set_channel_data');
   pak.writeAnsiString(this.channel_id);
   pak.writeBool(q);
   pak.writeAnsiString(key);
@@ -115,7 +125,7 @@ ClientChannelWorker.prototype.onMsg = function (msg, cb) {
 };
 
 ClientChannelWorker.prototype.pak = function (msg) {
-  let pak = this.subs.client.wsPak('channel_msg');
+  let pak = this.subs.client.pak('channel_msg');
   pak.writeAnsiString(this.channel_id);
   pak.writeAnsiString(msg);
   // pak.writeInt(flags);
@@ -131,6 +141,10 @@ ClientChannelWorker.prototype.send = function (msg, data, resp_func, old_fourth)
   }, resp_func);
 };
 
+ClientChannelWorker.prototype.cmdParse = function (cmd, resp_func) {
+  this.send('cmdparse', cmd, resp_func);
+};
+
 function SubscriptionManager(client, cmd_parse) {
   EventEmitter.call(this);
   this.client = client;
@@ -142,10 +156,14 @@ function SubscriptionManager(client, cmd_parse) {
   this.logging_in = false;
   this.logging_out = false;
   this.auto_create_user = false;
+  this.allow_anon = false;
+  this.no_auto_login = false;
   this.cmd_parse = cmd_parse;
   if (cmd_parse) {
-    this.cmds_list_by_worker = {};
+    this.cmds_fetched_by_type = {};
   }
+  this.base_handlers = {};
+  this.channel_handlers = {}; // channel type -> msg -> handler
 
   this.first_connect = true;
   this.server_time = 0;
@@ -153,7 +171,18 @@ function SubscriptionManager(client, cmd_parse) {
   client.onMsg('connect', this.handleConnect.bind(this));
   client.onMsg('channel_msg', this.handleChannelMessage.bind(this));
   client.onMsg('server_time', this.handleServerTime.bind(this));
-  client.onMsg('admin_msg', this.handleAdminMsg.bind(this));
+  client.onMsg('chat_broadcast', this.handleChatBroadcast.bind(this));
+  client.onMsg('restarting', this.handleRestarting.bind(this));
+  if (cmd_parse) {
+    client.onMsg('csr_to_client', this.handleCSRToClient.bind(this));
+  }
+  this.chunked = null;
+  client.onMsg('upload_start', this.handleUploadStart.bind(this));
+  client.onMsg('upload_chunk', this.handleUploadChunk.bind(this));
+  client.onMsg('upload_finish', this.handleUploadFinish.bind(this));
+  // Add handlers for all channel types
+  this.onChannelMsg(null, 'channel_data', ClientChannelWorker.prototype.handleChannelData);
+  this.onChannelMsg(null, 'apply_channel_data', ClientChannelWorker.prototype.handleApplyChannelData);
 }
 util.inherits(SubscriptionManager, EventEmitter);
 
@@ -164,18 +193,38 @@ SubscriptionManager.prototype.onceConnected = function (cb) {
   this.once('connect', cb);
 };
 
-SubscriptionManager.prototype.handleAdminMsg = function (data) {
-  console.error(data);
-  this.emit('admin_msg', data);
+SubscriptionManager.prototype.getBaseHandlers = function (channel_type) {
+  let handlers = this.channel_handlers[channel_type];
+  if (!handlers) {
+    handlers = this.channel_handlers[channel_type] = Object.create(this.base_handlers);
+  }
+  return handlers;
 };
 
-SubscriptionManager.prototype.handleConnect = function () {
+SubscriptionManager.prototype.onChannelMsg = function (channel_type, msg, cb) {
+  let handlers = channel_type ? this.getBaseHandlers(channel_type) : this.base_handlers;
+  assert(!handlers[msg]);
+  handlers[msg] = cb;
+};
+
+SubscriptionManager.prototype.handleChatBroadcast = function (data) {
+  console.error(`[${data.src}] ${data.msg}`);
+  this.emit('chat_broadcast', data);
+};
+
+SubscriptionManager.prototype.handleRestarting = function (data) {
+  this.restarting = data;
+  this.emit('restarting', data);
+};
+
+SubscriptionManager.prototype.handleConnect = function (data) {
   let reconnect = false;
   if (this.first_connect) {
     this.first_connect = false;
   } else {
     reconnect = true;
   }
+  this.restarting = Boolean(data.restarting);
 
   if (!this.client.connected || this.client.socket.readyState !== 1) { // WebSocket.OPEN
     // we got disconnected while trying to log in, we'll retry after reconnection
@@ -200,20 +249,22 @@ SubscriptionManager.prototype.handleConnect = function () {
     subs.emit('connect', reconnect);
   }
 
-  if (this.was_logged_in) {
+  if (this.logging_in) {
+    // already have a login in-flight, it should error before we try again
+  } else if (this.was_logged_in) {
     // Try to re-connect to existing login
     this.loginInternal(this.login_credentials, function (err) {
-      if (err && err === 'ERR_DISCONNECTED') {
+      if (err && err === 'ERR_FAILALL_DISCONNECT') {
         // we got disconnected while trying to log in, we'll retry after reconnection
       } else if (err) {
         // Error logging in upon re-connection, no good way to handle this?
         // TODO: Show some message to the user and prompt them to refresh?  Stay in "disconnected" state?
-        assert(false);
+        assert(false, err);
       } else {
         resub();
       }
     });
-  } else {
+  } else if (!this.no_auto_login) {
     // Try auto-login
     if (window.FBInstant) {
       this.loginFacebook(function () {
@@ -226,8 +277,9 @@ SubscriptionManager.prototype.handleConnect = function () {
     }
 
     resub();
+  } else {
+    resub();
   }
-
 };
 
 SubscriptionManager.prototype.handleChannelMessage = function (pak, resp_func) {
@@ -248,11 +300,12 @@ SubscriptionManager.prototype.handleChannelMessage = function (pak, resp_func) {
     console.log(`got channel_msg(${channel_id}) ${msg}: ${debug_msg}`);
   }
   let channel = this.getChannel(channel_id);
-  if (!channel.handlers[msg]) {
+  let handler = channel.handlers[msg];
+  if (!handler) {
     console.error(`no handler for channel_msg(${channel_id}) ${msg}: ${JSON.stringify(data)}`);
     return;
   }
-  channel.handlers[msg](data, resp_func);
+  handler.call(channel, data, resp_func);
 };
 
 SubscriptionManager.prototype.handleServerTime = function (pak) {
@@ -268,6 +321,7 @@ SubscriptionManager.prototype.handleServerTime = function (pak) {
   } else {
     this.server_time_interp = this.server_time;
   }
+  walltime.sync(pak.readInt());
 };
 
 SubscriptionManager.prototype.getServerTime = function () {
@@ -277,7 +331,61 @@ SubscriptionManager.prototype.getServerTime = function () {
 
 SubscriptionManager.prototype.tick = function (dt) {
   this.server_time_interp += dt;
+  for (let channel_id in this.channels) {
+    let channel = this.channels[channel_id];
+    if (channel.immediate_subscribe) {
+      if (dt >= channel.immediate_subscribe) {
+        channel.immediate_subscribe = 0;
+        this.unsubscribe(channel_id);
+      } else {
+        channel.immediate_subscribe -= dt;
+      }
+    }
+  }
 };
+
+
+SubscriptionManager.prototype.onUploadProgress = function (mime_type, cb) {
+  if (!this.upload_progress_cbs) {
+    this.upload_progress_cbs = {};
+  }
+  assert(!this.upload_progress_cbs[mime_type]);
+  this.upload_progress_cbs[mime_type] = cb;
+  if (!this.chunked) {
+    this.chunked = chunkedReceiverInit('client_receive', Infinity);
+  }
+  if (!this.chunked.on_progress) {
+    this.chunked.on_progress = (progress, total, type) => {
+      if (this.upload_progress_cbs[type]) {
+        this.upload_progress_cbs[type](progress, total);
+      }
+    };
+  }
+};
+
+SubscriptionManager.prototype.handleUploadStart = function (pak, resp_func) {
+  if (!this.chunked) {
+    this.chunked = chunkedReceiverInit('client_receive', Infinity);
+  }
+  chunkedReceiverStart(this.chunked, pak, resp_func);
+};
+
+SubscriptionManager.prototype.handleUploadChunk = function (pak, resp_func) {
+  chunkedReceiverOnChunk(this.chunked, pak, resp_func);
+};
+
+SubscriptionManager.prototype.handleUploadFinish = function (pak, resp_func) {
+  chunkedReceiverFinish(this.chunked, pak, resp_func);
+};
+
+SubscriptionManager.prototype.uploadGetFile = function (file_id) {
+  return chunkedReceiverGetFile(this.chunked, file_id);
+};
+
+SubscriptionManager.prototype.uploadFreeFile = function (file_data) {
+  return chunkedReceiverFreeFile(file_data);
+};
+
 
 SubscriptionManager.prototype.subscribe = function (channel_id) {
   this.getChannel(channel_id, true);
@@ -286,7 +394,9 @@ SubscriptionManager.prototype.subscribe = function (channel_id) {
 SubscriptionManager.prototype.getChannel = function (channel_id, do_subscribe) {
   let channel = this.channels[channel_id];
   if (!channel) {
-    channel = this.channels[channel_id] = new ClientChannelWorker(this, channel_id);
+    let channel_type = channel_id.split('.')[0];
+    let handlers = this.getBaseHandlers(channel_type);
+    channel = this.channels[channel_id] = new ClientChannelWorker(this, channel_id, handlers);
   }
   if (do_subscribe) {
     channel.subscriptions++;
@@ -333,8 +443,19 @@ SubscriptionManager.prototype.unsubscribe = function (channel_id) {
   }
 };
 
+// Immediate-mode channel subscription; will unsubscribe automatically on logout
+//   or if not accessed for some time
+SubscriptionManager.prototype.getChannelImmediate = function (channel_id, timeout) {
+  timeout = timeout || 60000;
+  let channel = this.getChannel(channel_id);
+  if (!channel.immediate_subscribe) {
+    this.subscribe(channel_id);
+  }
+  channel.immediate_subscribe = timeout;
+  return channel;
+};
+
 SubscriptionManager.prototype.onLogin = function (cb) {
-  this.getMyUserChannel();
   this.on('login', cb);
   if (this.logged_in) {
     return void cb();
@@ -352,7 +473,14 @@ SubscriptionManager.prototype.handleLoginResponse = function (resp_func, err, re
     this.logged_in_display_name = resp.display_name;
     this.logged_in = true;
     this.was_logged_in = true;
-    this.getMyUserChannel();
+    let user_channel = this.getMyUserChannel(); // auto-subscribe to it
+    user_channel.onceSubscribe(() => {
+      if (!this.did_master_subscribe && user_channel.getChannelData('public.permissions.sysadmin')) {
+        // For cmd_parse access
+        this.did_master_subscribe = true;
+        this.subscribe('master.master');
+      }
+    });
     this.emit('login');
   } else {
     this.emit('login_fail', err);
@@ -368,15 +496,11 @@ SubscriptionManager.prototype.loginInternal = function (login_credentials, resp_
   this.logged_in = false;
 
   if (login_credentials.fb) {
-    fbinstant.onready(() => {
-      window.FBInstant.player.getSignedPlayerInfoAsync().then((result) => {
-        this.client.send('login_facebook', {
-          signature: result.getSignature(),
-          display_name: window.FBInstant.player.getName(),
-        }, this.handleLoginResponse.bind(this, resp_func));
-      }).catch((err) => {
-        this.handleLoginResponse(resp_func, err);
-      });
+    fbGetLoginInfo((err, result) => {
+      if (err) {
+        return void this.handleLoginResponse(resp_func, err);
+      }
+      this.client.send('login_facebook', result, this.handleLoginResponse.bind(this, resp_func));
     });
   } else {
     this.client.send('login', {
@@ -482,9 +606,18 @@ SubscriptionManager.prototype.logout = function () {
   assert(this.logged_in);
   assert(!this.logging_in);
   assert(!this.logging_out);
-  // Don't know how to gracefully handle logging out with subscriptions currently, assert we have none
+  // Don't know how to gracefully handle logging out with app-level subscriptions
+  //   currently, clean up those we can, assert we have no others
+  if (this.did_master_subscribe) {
+    this.did_master_subscribe = false;
+    this.unsubscribe('master.master');
+  }
   for (let channel_id in this.channels) {
     let channel = this.channels[channel_id];
+    if (channel.immediate_subscribe) {
+      channel.immediate_subscribe = 0;
+      this.unsubscribe(channel_id);
+    }
     assert(!channel.subscriptions, `Remaining active subscription for ${channel_id}`);
     if (channel.autosubscribed) {
       channel.autosubscribed = false;
@@ -506,39 +639,29 @@ SubscriptionManager.prototype.logout = function () {
 };
 
 SubscriptionManager.prototype.serverLog = function (type, data) {
-  this.client.send('log', { type, data });
+  this.onceConnected(() => {
+    this.client.send('log', { type, data });
+  });
 };
 
 SubscriptionManager.prototype.sendCmdParse = function (command, resp_func) {
-  let self = this;
-  let channel_ids = Object.keys(self.channels);
-  let idx = 0;
-  let last_error = 'Unknown command';
-  function tryNext() {
-    let channel_id;
-    let channel;
-    do {
-      channel_id = channel_ids[idx++];
-      channel = self.channels[channel_id];
-    } while (channel_id && (!channel || !(channel.subscriptions || channel.autosubscribed)));
-    if (!channel_id) {
-      self.serverLog('cmd_parse_unknown', command);
-      return resp_func(last_error);
+  this.onceConnected(() => {
+    let pak = this.client.pak('cmd_parse_auto');
+    pak.writeString(command);
+    pak.send(resp_func);
+  });
+};
+
+SubscriptionManager.prototype.handleCSRToClient = function (pak, resp_func) {
+  let cmd = pak.readString();
+  let access = pak.readJSON();
+  this.cmd_parse.handle({ access }, cmd, (err, resp) => {
+    if (err && this.cmd_parse.was_not_found) {
+      // bounce back to server
+      return resp_func(null, { found: 0, err });
     }
-    return channel.send('cmdparse', command,
-      function (err, resp) {
-        if (err || resp && resp.found) {
-          return resp_func(err, resp ? resp.resp : null);
-        }
-        // otherwise, was not found
-        if (resp && resp.err) {
-          last_error = resp.err;
-        }
-        return self.onceConnected(tryNext);
-      }
-    );
-  }
-  self.onceConnected(tryNext);
+    return resp_func(err, { found: 1, resp });
+  });
 };
 
 export function create(client, cmd_parse) {

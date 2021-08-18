@@ -22,6 +22,7 @@ let edit_box1;
 let edit_box2;
 let test_select1;
 let test_select2;
+let test_select_large1;
 let test_scroll_area;
 let slider_value = 1;
 let test_lines = 10;
@@ -72,6 +73,17 @@ function init(x, y, column_width) {
     width: column_width - 8,
   });
 
+  let large_param = {
+    items: [],
+    is_dropdown: true,
+    z: Z.UI,
+    width: column_width - 8,
+  };
+  for (let ii = 0; ii < 100; ++ii) {
+    large_param.items.push(`item${ii}`);
+  }
+  test_select_large1 = selection_box.create(large_param);
+
   test_scroll_area = scrollAreaCreate();
 }
 
@@ -109,10 +121,12 @@ export function run(x, y, z) {
     h: ui.font_height * 8 + pad,
   });
   let internal_y = 2;
-  ui.print(font_style, 2, internal_y, z + 1, `Edit Box Text: ${edit_box1.text}+${edit_box2.text}`);
-  internal_y += ui.font_height + pad;
+  internal_y += ui.font.drawSizedAligned(font_style, 2, internal_y, z + 1,
+    ui.font_height, ui.font.ALIGN.HWRAP|ui.font.ALIGN.HFIT, 100 - test_scroll_area.barWidth() - 2, 0,
+    `Edit Box Text: ${edit_box1.text}+${edit_box2.text}`) + pad;
   ui.print(font_style, 2, internal_y, z + 1, `Result: ${demo_result}`);
   internal_y += ui.font_height + pad;
+  internal_y += test_select_large1.run({ x: 2, y: internal_y, z: z + 1 }) + pad;
   for (let ii = 0; ii < test_lines; ++ii) {
     ui.print(font_style, 2, internal_y, z + 1, `Line #${ii}`);
     internal_y += ui.font_height + pad;
@@ -176,6 +190,12 @@ export function run(x, y, z) {
     max: 2,
   });
   ui.print(null, x + ui.button_width + pad, y, z, `${slider_value.toFixed(2)}`);
+  ui.progressBar({
+    x: x + ui.button_width + pad * 2 + ui.font_height * 2,
+    y, z,
+    w: 60, h: ui.button_height,
+    progress: slider_value,
+  });
   y += ui.button_height;
 }
 
@@ -217,7 +237,7 @@ export function runFontTest(x, y) {
     glow_xoffs: 3.25, glow_yoffs: 3.25, glow_inner: -2.5, glow_outer: 5, glow_color: COLOR_GREEN,
     color: COLOR_WHITE
   });
-  font.drawSized(font_style_shadow, x, y, z, font_size, 'Glow (Shadow) O0O');
+  font.drawSized(font_style_shadow, x, y, z, font_size, 'Glow (Shadow) O0O1Il');
   y += font_size;
 
   const font_style_both = glov_font.style(null, {

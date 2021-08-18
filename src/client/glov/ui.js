@@ -16,21 +16,28 @@ Z.TRANSITION_RANGE = Z.TRANSITION_RANGE || 10;
 
 Z.FPSMETER = Z.FPSMETER || 10000;
 
+export const LINE_ALIGN = 1<<0;
+export const LINE_CAP_SQUARE = 1<<1;
+export const LINE_CAP_ROUND = 1<<2;
+
 const assert = require('assert');
 const camera2d = require('./camera2d.js');
 const glov_edit_box = require('./edit_box.js');
 const effects = require('./effects.js');
+const { effectsQueue } = effects;
 const glov_engine = require('./engine.js');
 const glov_font = require('./font.js');
 const glov_input = require('./input.js');
+const { mouseMoved } = glov_input;
 const { linkTick } = require('./link.js');
-const { abs, max, min, round, sqrt } = Math;
+const { abs, floor, max, min, round, sqrt } = Math;
 const { soundLoad, soundPlay } = require('./sound.js');
 const glov_sprites = require('./sprites.js');
+const { clipped, clipPause, clipResume } = glov_sprites;
 const textures = require('./textures.js');
-const { clamp, clone, lerp, merge } = require('../../common/util.js');
+const { clamp, clone, lerp, merge } = require('glov/util.js');
 const { mat43, m43identity, m43mul } = require('./mat43.js');
-const { vec2, vec4, v4scale } = require('./vmath.js');
+const { vec2, vec4, v4scale, unit_vec } = require('glov/vmath.js');
 
 const MODAL_DARKEN = 0.75;
 let KEYS;
@@ -67,25 +74,29 @@ export function makeColorSet(color) {
   return ret;
 }
 
-function doBlurEffect(factor, params) {
-  factor = lerp(factor, params.blur[0], params.blur[1]);
-  if (factor) {
-    effects.applyGaussianBlur({
-      source: glov_engine.captureFramebuffer(),
-      blur: factor,
-      // min_size: 128,
-    });
-  }
+let hooks = [];
+export function addHook(draw, click) {
+  hooks.push({
+    draw,
+    click,
+  });
+}
+
+let focus_parent_id = '';
+export function focusIdSet(new_value) {
+  focus_parent_id = new_value || '';
+}
+
+function doBlurEffect(factor) {
+  effects.applyGaussianBlur({
+    blur: factor,
+    // min_size: 128,
+  });
 }
 
 let desaturate_xform = mat43();
 let desaturate_tmp = mat43();
-function doDesaturateEffect(factor, params) {
-  let saturation = lerp(factor, params.saturation[0], params.saturation[1]);
-  let brightness = lerp(factor, params.brightness[0], params.brightness[1]);
-  if (saturation === 1 && brightness === 1) {
-    return;
-  }
+function doDesaturateEffect(saturation, brightness) {
   m43identity(desaturate_xform);
 
   effects.saturationMatrix(desaturate_tmp, saturation);
@@ -124,7 +135,6 @@ function doDesaturateEffect(factor, params) {
   // }
   effects.applyColorMatrix({
     colorMatrix: desaturate_xform,
-    source: glov_engine.captureFramebuffer(),
   });
 }
 
@@ -151,6 +161,7 @@ export let font_style_focused = glov_font.style(null, {
 export let font_style_normal = glov_font.styleColored(null, 0x000000ff);
 
 export let font;
+export let title_font;
 export let sprites = {};
 
 export let color_button = makeColorSet([1,1,1,1]);
@@ -190,6 +201,8 @@ let focused_key_prev2;
 let pad_focus_left;
 let pad_focus_right;
 
+let default_line_mode;
+
 export function colorSetSetShades(rollover, down, disabled) {
   color_set_shades[1] = rollover;
   color_set_shades[2] = down;
@@ -199,6 +212,8 @@ export function colorSetSetShades(rollover, down, disabled) {
 
 export function loadUISprite(name, ws, hs, overrides, only_override) {
   let override = overrides && overrides[name];
+  let wrap_s = gl.CLAMP_TO_EDGE;
+  let wrap_t = (name === 'scrollbar_trough') ? gl.REPEAT : gl.CLAMP_TO_EDGE;
   if (override === null) {
     // skip it, assume not used
   } else if (override) {
@@ -206,18 +221,28 @@ export function loadUISprite(name, ws, hs, overrides, only_override) {
       name: override[0],
       ws: override[1],
       hs: override[2],
+      wrap_s,
+      wrap_t,
     });
   } else if (!only_override) {
     sprites[name] = glov_sprites.create({
       name: `ui/${name}`,
       ws,
       hs,
+      wrap_s,
+      wrap_t,
     });
   }
 }
 
+export function setFonts(new_font, new_title_font) {
+  font = new_font;
+  title_font = new_title_font || font;
+}
+
 export function startup(param) {
   font = param.font;
+  title_font = param.title_font || font;
   let overrides = param.ui_sprites;
   KEYS = glov_input.KEYS;
   PAD = glov_input.PAD;
@@ -248,6 +273,8 @@ export function startup(param) {
   loadUISprite('scrollbar_top', [11], [13], overrides);
   loadUISprite('scrollbar_handle_grabber', [11], [13], overrides);
   loadUISprite('scrollbar_handle', [11], [3, 7, 3], overrides);
+  loadUISprite('progress_bar', [3, 7, 3], [13], overrides);
+  loadUISprite('progress_bar_trough', [3, 7, 3], [13], overrides);
 
   sprites.white = glov_sprites.create({ url: 'white' });
 
@@ -259,6 +286,17 @@ export function startup(param) {
   button_keys.yes.key.push(KEYS.Y);
   button_keys.no = clone(button_keys.cancel);
   button_keys.no.key.push(KEYS.N);
+
+  if (param.line_mode !== undefined) {
+    default_line_mode = param.line_mode;
+  } else {
+    default_line_mode = LINE_ALIGN|LINE_CAP_ROUND;
+    // let is_pixely = param.pixely && param.pixely !== 'off';
+    // if (is_pixely) {
+    //   // Maybe want to not do aligning here, causes inconsistencies when smoothly scrolling
+    //   default_line_mode = 0;
+    // }
+  }
 }
 
 let dynamic_text_elem;
@@ -307,21 +345,29 @@ export function bindSounds(_sounds) {
 
 export function drawHBox(coords, s, color) {
   let uidata = s.uidata;
-  let ws = [uidata.wh[0] * coords.h, 0, uidata.wh[2] * coords.h];
   let x = coords.x;
-  ws[1] = max(0, coords.w - ws[0] - ws[2]);
+  let ws = [uidata.wh[0] * coords.h, 0, uidata.wh[2] * coords.h];
+  if (coords.no_min_width && ws[0] + ws[2] > coords.w) {
+    let scale = coords.w / (ws[0] + ws[2]);
+    ws[0] *= scale;
+    ws[2] *= scale;
+  } else {
+    ws[1] = max(0, coords.w - ws[0] - ws[2]);
+  }
   for (let ii = 0; ii < ws.length; ++ii) {
     let my_w = ws[ii];
-    s.draw({
-      x,
-      y: coords.y,
-      z: coords.z,
-      color,
-      w: my_w,
-      h: coords.h,
-      uvs: uidata.rects[ii],
-      // nozoom: true, // nozoom since different parts of the box get zoomed differently
-    });
+    if (my_w) {
+      s.draw({
+        x,
+        y: coords.y,
+        z: coords.z || Z.UI,
+        color,
+        w: my_w,
+        h: coords.h,
+        uvs: uidata.rects[ii],
+        nozoom: true, // nozoom since different parts of the box get zoomed differently
+      });
+    }
     x += my_w;
   }
 }
@@ -341,7 +387,7 @@ export function drawVBox(coords, s, color) {
       w: coords.w,
       h: my_h,
       uvs: uidata.rects[ii],
-      // nozoom: true, // nozoom since different parts of the box get zoomed differently
+      nozoom: true, // nozoom since different parts of the box get zoomed differently
     });
     y += my_h;
   }
@@ -388,11 +434,12 @@ export function playUISound(name, volume) {
 }
 
 export function setMouseOver(key, quiet) {
-  if (last_frame_button_mouseover !== key && frame_button_mouseover !== key && !quiet) {
+  if (last_frame_button_mouseover !== key && frame_button_mouseover !== key && !quiet && mouseMoved()) {
     playUISound('rollover');
   }
   frame_button_mouseover = key;
   button_mouseover = true;
+  glov_input.mouseOverCaptured();
 }
 
 export function focusSteal(key) {
@@ -483,7 +530,7 @@ export function panel(param) {
   assert(typeof param.h === 'number');
   param.z = param.z || (Z.UI - 1);
   let color = param.color || color_panel;
-  drawBox(param, sprites.panel, param.pixel_scale || panel_pixel_scale, color);
+  drawBox(param, param.sprite || sprites.panel, param.pixel_scale || panel_pixel_scale, color);
   glov_input.click(param);
   glov_input.mouseOver(param);
 }
@@ -493,17 +540,29 @@ export function drawTooltip(param) {
   assert(typeof param.y === 'number');
   assert(typeof param.tooltip === 'string');
 
-  let tooltip_w = param.tooltip_width || tooltip_width;
-  let x = param.x;
-  if (x + tooltip_w > camera2d.x1()) {
-    x = camera2d.x1() - tooltip_w;
+  let clip_pause = clipped();
+  if (clip_pause) {
+    clipPause();
   }
+
+  let tooltip_w = param.tooltip_width || tooltip_width;
   let z = param.z || Z.TOOLTIP;
   let tooltip_y0 = param.y;
   let eff_tooltip_pad = param.tooltip_pad || tooltip_pad;
   let w = tooltip_w - eff_tooltip_pad * 2;
-  if (param.tooltip_above) {
-    tooltip_y0 -= font_height * font.numLines(modal_font_style, w, 0, font_height, param.tooltip) + eff_tooltip_pad * 2;
+  let dims = font.dims(modal_font_style, w, 0, font_height, param.tooltip);
+  let above = param.tooltip_above;
+  if (!above && param.tooltip_auto_above_offset) {
+    above = tooltip_y0 + dims.h + eff_tooltip_pad * 2 > camera2d.y1();
+  }
+  let x = param.x;
+  let eff_tooltip_w = dims.w + eff_tooltip_pad * 2;
+  if (x + eff_tooltip_w > camera2d.x1()) {
+    x = camera2d.x1() - eff_tooltip_w;
+  }
+
+  if (above) {
+    tooltip_y0 -= dims.h + eff_tooltip_pad * 2 + (param.tooltip_auto_above_offset || 0);
   }
   let y = tooltip_y0 + eff_tooltip_pad;
   y += font.drawSizedWrapped(modal_font_style,
@@ -516,24 +575,76 @@ export function drawTooltip(param) {
     x,
     y: tooltip_y0,
     z,
-    w: tooltip_w,
+    w: eff_tooltip_w,
     h: y - tooltip_y0,
     pixel_scale,
   });
+  if (clip_pause) {
+    clipResume();
+  }
+}
+
+export function checkHooks(param, click) {
+  if (param.hook) {
+    for (let ii = 0; ii < hooks.length; ++ii) {
+      if (click) {
+        hooks[ii].click(param);
+      }
+      hooks[ii].draw(param);
+    }
+  }
+}
+
+export function drawTooltipBox(param) {
+  drawTooltip({
+    x: param.x,
+    y: param.y + param.h + 2,
+    tooltip_auto_above_offset: param.h + 4,
+    tooltip_above: param.tooltip_above,
+    tooltip: param.tooltip,
+    tooltip_width: param.tooltip_width,
+  });
+}
+
+export function progressBar(param) {
+  drawHBox(param, sprites.progress_bar_trough, param.color_trough || param.color || unit_vec);
+  let progress = clamp(param.progress, 0, 1);
+  drawHBox({
+    x: param.x + (param.centered ? param.w * (1-progress) * 0.5 : 0),
+    y: param.y,
+    z: (param.z || Z.UI) + 0.1,
+    w: param.w * progress,
+    h: param.h,
+    no_min_width: true,
+  }, sprites.progress_bar, param.color || unit_vec);
+  if (param.tooltip) {
+    if (glov_input.mouseOver(param)) {
+      drawTooltipBox(param);
+    }
+  }
 }
 
 // eslint-disable-next-line complexity
 export function buttonShared(param) {
+  param.z = param.z || Z.UI;
   let state = 'regular';
   let ret = false;
+  let key = param.key || `${focus_parent_id}_${param.x}_${param.y}`;
+  let rollover_quiet = param.rollover_quiet;
+  button_mouseover = false;
   if (param.draw_only) {
+    if (param.draw_only_mouseover && (!param.disabled || param.disabled_mouseover)) {
+      if (glov_input.mouseOver(param)) {
+        setMouseOver(key, rollover_quiet);
+      }
+      if (button_mouseover && param.tooltip) {
+        drawTooltipBox(param);
+      }
+    }
     return { ret, state };
   }
-  let key = param.key || `${param.x}_${param.y}`;
-  let rollover_quiet = param.rollover_quiet;
   let focused = !param.disabled && !param.no_focus && focusCheck(key);
   let key_opts = param.in_event_cb ? { in_event_cb: param.in_event_cb } : null;
-  button_mouseover = false;
   if (param.disabled) {
     if (glov_input.mouseOver(param)) { // Still eat mouse events
       if (param.disabled_mouseover) {
@@ -542,43 +653,43 @@ export function buttonShared(param) {
     }
     state = 'disabled';
   } else if (param.drag_target && (ret = glov_input.dragDrop(param))) {
-    if (!param.no_touch_mouseover || !glov_input.mousePosIsTouch()) {
+    if (!glov_input.mousePosIsTouch()) {
       setMouseOver(key, rollover_quiet);
     }
     if (!param.no_focus) {
       focusSteal(key);
       focused = true;
     }
+    button_click = { drag: true };
   } else if ((button_click = glov_input.click(param)) ||
     param.long_press && (button_click = glov_input.longPress(param))
   ) {
-    if (!param.no_touch_mouseover || !glov_input.mousePosIsTouch()) {
-      setMouseOver(key, rollover_quiet);
-    }
-    if (param.touch_twice && glov_input.mousePosIsTouch() && !focused) {
+    if (param.touch_twice && !focused && glov_input.mousePosIsTouch()) {
       // Just focus, show tooltip
       touch_changed_focus = true;
+      setMouseOver(key, rollover_quiet);
     } else {
       ret = true;
+      if (last_frame_button_mouseover === key) {
+        // preserve mouse over if we have it
+        setMouseOver(key, rollover_quiet);
+      }
     }
     if (!param.no_focus) {
       focusSteal(key);
       focused = true;
     }
   } else if (param.drag_target && glov_input.dragOver(param)) {
-    // Set this even if param.no_touch_mouse_over is set
+    // Mouseover even if touch?
     setMouseOver(key, rollover_quiet);
     state = glov_input.mouseDown({ max_dist: Infinity }) ? 'down' : 'rollover';
   } else if (param.drag_over && glov_input.dragOver(param)) {
     // do nothing
   } else if (glov_input.mouseOver(param)) {
-    if (param.no_touch_mouseover && glov_input.mousePosIsTouch()) {
-      // do not set mouseover
-    } else if (param.touch_twice && !focused && glov_input.mousePosIsTouch()) {
-      // do not set mouseover
-    } else {
+    state = glov_input.mouseDown(param) ? 'down' : 'rollover';
+    // On touch, only set mouseover if also down
+    if (!glov_input.mousePosIsTouch() || state === 'down') {
       setMouseOver(key, rollover_quiet);
-      state = glov_input.mouseDown(param) ? 'down' : 'rollover';
     }
   }
   button_focused = focused;
@@ -586,6 +697,7 @@ export function buttonShared(param) {
     if (glov_input.keyDownEdge(KEYS.SPACE, key_opts) || glov_input.keyDownEdge(KEYS.RETURN, key_opts) ||
       glov_input.padButtonDownEdge(PAD.A)
     ) {
+      button_click = { kb: true };
       ret = true;
     }
   }
@@ -594,31 +706,32 @@ export function buttonShared(param) {
     playUISound('button_click');
   }
   if (button_mouseover && param.tooltip) {
-    drawTooltip({
-      x: param.x,
-      y: param.tooltip_above ? param.y - 2 : param.y + param.h + 2,
-      tooltip_above: param.tooltip_above,
-      tooltip: param.tooltip,
-      tooltip_width: param.tooltip_width,
-    });
+    drawTooltipBox(param);
   }
   param.z += param.z_bias && param.z_bias[state] || 0;
+  checkHooks(param, ret);
   return { ret, state, focused };
 }
 
 export let button_last_color;
-export function buttonTextDraw(param, state, focused) {
+function buttonBackgroundDraw(param, state) {
   let colors = param.colors || color_button;
   let color = button_last_color = colors[state];
-  let base_name = param.base_name || 'button';
-  let sprite_name = `${base_name}_${state}`;
-  let sprite = sprites[sprite_name];
-  // Note: was if (sprite) color = colors.regular for specific-sprite matches
-  if (!sprite) {
-    sprite = sprites[base_name];
-  }
+  if (!param.no_bg) {
+    let base_name = param.base_name || 'button';
+    let sprite_name = `${base_name}_${state}`;
+    let sprite = sprites[sprite_name];
+    // Note: was if (sprite) color = colors.regular for specific-sprite matches
+    if (!sprite) {
+      sprite = sprites[base_name];
+    }
 
-  drawHBox(param, sprite, color);
+    drawHBox(param, sprite, color);
+  }
+}
+
+export function buttonTextDraw(param, state, focused) {
+  buttonBackgroundDraw(param, state);
   let hpad = min(param.font_height * 0.25, param.w * 0.1);
   font.drawSizedAligned(
     focused ? font_style_focused : font_style_normal,
@@ -633,7 +746,7 @@ export function buttonText(param) {
   assert(typeof param.y === 'number');
   assert(typeof param.text === 'string');
   // optional params
-  param.z = param.z || Z.UI;
+  // param.z = param.z || Z.UI;
   param.w = param.w || button_width;
   param.h = param.h || button_height;
   param.font_height = param.font_height || font_height;
@@ -643,41 +756,20 @@ export function buttonText(param) {
   return ret;
 }
 
-export function buttonImage(param) {
-  // required params
-  assert(typeof param.x === 'number');
-  assert(typeof param.y === 'number');
-  assert(param.img && param.img.draw); // should be a sprite
-  // optional params
-  param.z = param.z || Z.UI;
-  param.w = param.w || button_img_size;
-  param.h = param.h || param.w || button_img_size;
-  param.shrink = param.shrink || 0.75;
-  //param.img_rect; null -> full image
+function buttonImageDraw(param, state, focused) {
   let uvs = param.img_rect;
+  let img = param.imgs && param.imgs[state] || param.img;
   if (typeof param.frame === 'number') {
-    uvs = param.img.uidata.rects[param.frame];
+    uvs = img.uidata.rects[param.frame];
   }
-
-  let { ret, state } = buttonShared(param);
-  let colors = param.colors || color_button;
-  let color = button_last_color = colors[state];
-  if (!param.no_bg) {
-    let base_name = param.base_name || 'button';
-    let sprite_name = `${base_name}_${state}`;
-    let sprite = sprites[sprite_name];
-    if (!sprite) {
-      sprite = sprites[base_name];
-    }
-
-    drawHBox(param, sprite, color);
-  }
-  let img_origin = param.img.origin;
-  let img_w = param.img.size[0];
-  let img_h = param.img.size[1];
+  buttonBackgroundDraw(param, state);
+  let color = button_last_color;
+  let img_origin = img.origin;
+  let img_w = img.size[0];
+  let img_h = img.size[1];
   let aspect = img_w / img_h;
   if (typeof param.frame === 'number') {
-    aspect = param.img.uidata.aspect ? param.img.uidata.aspect[param.frame] : 1;
+    aspect = img.uidata.aspect ? img.uidata.aspect[param.frame] : 1;
   }
   let largest_w_horiz = param.w * param.shrink;
   let largest_w_vert = param.h * param.shrink * aspect;
@@ -688,10 +780,11 @@ export function buttonImage(param) {
     x: param.x + (param.left_align ? pad_top : (param.w - img_w) / 2) + img_origin[0] * img_w,
     y: param.y + pad_top + img_origin[1] * img_h,
     z: param.z + 0.1,
-    color: param.color1 && param.color ? param.color : color, // use explicit tint if doing dual-tinting
+    // use img_color if provided, use explicit tint if doing dual-tinting, otherwise button color
+    color: param.img_color || param.color1 && param.color || color,
     color1: param.color1,
-    w: img_w / param.img.size[0],
-    h: img_h / param.img.size[1],
+    w: img_w / img.size[0],
+    h: img_h / img.size[1],
     uvs,
     rot: param.rotation,
   };
@@ -701,15 +794,90 @@ export function buttonImage(param) {
     draw_param.w = -w;
   }
   if (param.color1) {
-    param.img.drawDualTint(draw_param);
+    img.drawDualTint(draw_param);
   } else {
-    param.img.draw(draw_param);
+    img.draw(draw_param);
   }
+}
+
+export function buttonImage(param) {
+  // required params
+  assert(typeof param.x === 'number');
+  assert(typeof param.y === 'number');
+  assert(param.imgs || param.img && param.img.draw); // should be a sprite
+  // optional params
+  param.z = param.z || Z.UI;
+  param.w = param.w || button_img_size;
+  param.h = param.h || param.w || button_img_size;
+  param.shrink = param.shrink || 0.75;
+  //param.img_rect; null -> full image
+
+  let { ret, state, focused } = buttonShared(param);
+  buttonImageDraw(param, state, focused);
+  return ret;
+}
+
+export function button(param) {
+  if (param.img && !param.text) {
+    return buttonImage(param);
+  } else if (param.text && !param.img) {
+    return buttonText(param);
+  }
+
+  // required params
+  assert(typeof param.x === 'number');
+  assert(typeof param.y === 'number');
+  assert(param.img && param.img.draw); // should be a sprite
+  // optional params
+  param.z = param.z || Z.UI;
+  // w/h initialize differently than either buttonText or buttonImage
+  param.h = param.h || button_img_size;
+  param.w = param.w || button_width;
+  param.shrink = param.shrink || 0.75;
+  //param.img_rect; null -> full image
+  param.left_align = true; // always left-align images
+  param.font_height = param.font_height || font_height;
+
+  let { ret, state, focused } = buttonShared(param);
+  buttonImageDraw(param, state, focused);
+  // Hide some stuff on the second draw
+  let saved_no_bg = param.no_bg;
+  let saved_w = param.w;
+  let saved_x = param.x;
+  param.no_bg = true;
+  param.x += param.h * param.shrink;
+  param.w -= param.h * param.shrink;
+  buttonTextDraw(param, state, focused);
+
+  param.no_bg = saved_no_bg;
+  param.w = saved_w;
+  param.x = saved_x;
   return ret;
 }
 
 export function print(style, x, y, z, text) {
   return font.drawSized(style, x, y, z, font_height, text);
+}
+
+export function label(param) {
+  let { style, x, y, align, w, h, text, tooltip } = param;
+  let z = param.z || Z.UI;
+  let size = param.size || font_height;
+  assert(isFinite(x));
+  assert(isFinite(y));
+  assert.equal(typeof text, 'string');
+  if (align) {
+    font.drawSizedAligned(style, x, y, z, size, align, w, h, text);
+  } else {
+    font.drawSized(style, x, y, z, size, text);
+  }
+  if (tooltip) {
+    assert(isFinite(w));
+    assert(isFinite(h));
+    if (glov_input.mouseOver(param)) {
+      drawTooltipBox(param);
+    }
+  }
 }
 
 // Note: modal dialogs not really compatible with HTML overlay on top of the canvas!
@@ -761,7 +929,7 @@ function modalDialogRun() {
   const x0 = camera2d.x0() + round((game_width - eff_modal_width) / 2);
   let x = x0 + pad;
   const y0 = fullscreen_mode ? 0 : (modal_dialog.y0 || modal_y0);
-  let y = y0 + pad;
+  let y = round(y0 + pad);
 
   if (glov_input.pointerLocked()) {
     glov_input.pointerLockExit();
@@ -769,15 +937,15 @@ function modalDialogRun() {
 
   if (modal_dialog.title) {
     if (fullscreen_mode) {
-      font.drawSizedAligned(modal_font_style, x, y, Z.MODAL, eff_font_height * modal_title_scale,
+      title_font.drawSizedAligned(modal_font_style, x, y, Z.MODAL, eff_font_height * modal_title_scale,
         glov_font.ALIGN.HFIT, text_w, 0, modal_dialog.title);
       y += eff_font_height * modal_title_scale;
     } else {
-      y += font.drawSizedWrapped(modal_font_style,
+      y += title_font.drawSizedWrapped(modal_font_style,
         x, y, Z.MODAL, text_w, 0, eff_font_height * modal_title_scale,
         modal_dialog.title);
     }
-    y += round(vpad * 1.5);
+    y = round(y + vpad * 1.5);
   }
 
   if (modal_dialog.text) {
@@ -789,7 +957,7 @@ function modalDialogRun() {
       y += font.drawSizedWrapped(modal_font_style, x, y, Z.MODAL, text_w, 0, eff_font_height,
         modal_dialog.text);
     }
-    y += vpad;
+    y = round(y + vpad);
   }
 
   let tick_key;
@@ -842,7 +1010,7 @@ function modalDialogRun() {
     })) {
       did_button = ii;
     }
-    x += pad + eff_button_width;
+    x = round(x + pad + eff_button_width);
   }
   // Also check low-priority keys
   if (did_button === -1) {
@@ -867,7 +1035,7 @@ function modalDialogRun() {
     }
   }
   y += eff_button_height;
-  y += vpad + pad;
+  y = round(y + vpad + pad);
   panel({
     x: x0,
     y: y0,
@@ -938,6 +1106,12 @@ export function createEditBox(param) {
   return glov_edit_box.create(param);
 }
 
+let slider_default_vshrink = 1.0;
+let slider_default_handle_shrink = 1.0;
+export function setSliderDefaultShrink(vshrink, handle_shrink) {
+  slider_default_vshrink = vshrink;
+  slider_default_handle_shrink = handle_shrink;
+}
 const color_slider_handle = vec4(1,1,1,1);
 const color_slider_handle_grab = vec4(0.5,0.5,0.5,1);
 const color_slider_handle_over = vec4(0.75,0.75,0.75,1);
@@ -952,13 +1126,24 @@ export function slider(value, param) {
   param.z = param.z || Z.UI;
   param.w = param.w || button_width;
   param.h = param.h || button_height;
+  let vshrink = param.vshrink || slider_default_vshrink;
+  let handle_shrink = param.handle_shrink || slider_default_handle_shrink;
   let disabled = param.disabled || false;
+  let handle_h = param.h * handle_shrink;
+  let handle_w = sprites.slider_handle.uidata.wh[0] * handle_h;
 
   slider_dragging = false;
 
-  drawHBox(param, sprites.slider, param.color);
+  let shrinkdiff = handle_shrink - vshrink;
+  drawHBox({
+    x: param.x + param.h * shrinkdiff/2,
+    y: param.y + param.h * (1 - vshrink)/2,
+    z: param.z,
+    w: param.w - param.h * shrinkdiff,
+    h: param.h * vshrink,
+  }, sprites.slider, param.color);
 
-  let xoffs = round(sprites.slider.uidata.wh[0] * param.h / 2);
+  let xoffs = round(max(sprites.slider.uidata.wh[0] * param.h * vshrink, handle_w) / 2);
   let draggable_width = param.w - xoffs * 2;
 
   // Draw notches - would also need to quantize the values below
@@ -1003,8 +1188,6 @@ export function slider(value, param) {
   }
   let rollover = !disabled && glov_input.mouseOver(param);
   let handle_center_pos = param.x + xoffs + draggable_width * (value - param.min) / (param.max - param.min);
-  let handle_h = param.h;
-  let handle_w = sprites.slider_handle.uidata.wh[0] * handle_h;
   let handle_x = handle_center_pos - handle_w / 2;
   let handle_y = param.y + param.h / 2 - handle_h / 2;
   let handle_color = color_slider_handle;
@@ -1028,6 +1211,10 @@ export function slider(value, param) {
 }
 
 let pp_bad_frames = 0;
+
+export function isMenuUp() {
+  return modal_dialog || menu_up;
+}
 
 export function tickUI(dt) {
   last_frame_button_mouseover = frame_button_mouseover;
@@ -1056,8 +1243,16 @@ export function tickUI(dt) {
     // Effects during modal dialogs
     let factor = min(menu_up_time / 500, 1);
     if (glov_engine.postprocessing && !glov_engine.defines.NOPP) {
-      glov_sprites.queuefn(params.z - 2, doBlurEffect.bind(null, factor, params));
-      glov_sprites.queuefn(params.z - 1, doDesaturateEffect.bind(null, factor, params));
+      // Note: this lerp used to be done later in the frame (during drawing, not queueing) a problem?
+      let blur_factor = lerp(factor, params.blur[0], params.blur[1]);
+      if (blur_factor) {
+        effectsQueue(params.z - 2, doBlurEffect.bind(null, blur_factor));
+      }
+      let saturation = lerp(factor, params.saturation[0], params.saturation[1]);
+      let brightness = lerp(factor, params.brightness[0], params.brightness[1]);
+      if (saturation !== 1 || brightness !== 1) {
+        effectsQueue(params.z - 1, doDesaturateEffect.bind(null, saturation, brightness));
+      }
       pp_this_frame = true;
     } else {
       // Or, just darken
@@ -1107,6 +1302,13 @@ export function endFrame() {
   }
 
   while (dom_elems_issued < dom_elems.length) {
+    let elem = dom_elems.pop();
+    dynamic_text_elem.removeChild(elem);
+  }
+}
+
+export function cleanupDOMElems() {
+  while (dom_elems.length) {
     let elem = dom_elems.pop();
     dynamic_text_elem.removeChild(elem);
   }
@@ -1178,6 +1380,10 @@ export function drawRect(x0, y0, x1, y1, z, color) {
   });
 }
 
+export function drawRect2(param) {
+  drawRect(param.x, param.y, param.x + param.w, param.y + param.h, param.z, param.color);
+}
+
 function spreadTechParams(spread) {
   // spread=0 -> 1
   // spread=0.5 -> 2
@@ -1194,19 +1400,19 @@ function spreadTechParams(spread) {
   return tech_params;
 }
 
-function drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color) {
+function drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color, blend) {
   glov_sprites.queueraw(sprite.texs,
     x0, y0, z, x1 - x0, y1 - y0,
     tu0, tv0, tu1, tv1,
-    color, glov_font.font_shaders.font_aa, spreadTechParams(spread));
+    color, glov_font.font_shaders.font_aa, spreadTechParams(spread), blend);
 }
 
-function drawCircleInternal(sprite, x, y, z, r, spread, tu0, tv0, tu1, tv1, color) {
+function drawCircleInternal(sprite, x, y, z, r, spread, tu0, tv0, tu1, tv1, color, blend) {
   let x0 = x - r * 2 + r * 4 * tu0;
   let x1 = x - r * 2 + r * 4 * tu1;
   let y0 = y - r * 2 + r * 4 * tv0;
   let y1 = y - r * 2 + r * 4 * tv1;
-  drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color);
+  drawElipseInternal(sprite, x0, y0, x1, y1, z, spread, tu0, tv0, tu1, tv1, color, blend);
 }
 
 function initCircleSprite() {
@@ -1226,28 +1432,28 @@ function initCircleSprite() {
     format: textures.format.R8,
     data,
     filter_min: gl.LINEAR,
-    filter_max: gl.LINEAR,
+    filter_mag: gl.LINEAR,
     wrap_s: gl.CLAMP_TO_EDGE,
     wrap_t: gl.CLAMP_TO_EDGE,
     origin: vec2(0.5, 0.5),
   });
 }
 
-export function drawElipse(x0, y0, x1, y1, z, spread, color) {
+export function drawElipse(x0, y0, x1, y1, z, spread, color, blend) {
   if (!sprites.circle) {
     initCircleSprite();
   }
-  drawElipseInternal(sprites.circle, x0, y0, x1, y1, z, spread, 0, 0, 1, 1, color);
+  drawElipseInternal(sprites.circle, x0, y0, x1, y1, z, spread, 0, 0, 1, 1, color, blend);
 }
 
-export function drawCircle(x, y, z, r, spread, color) {
+export function drawCircle(x, y, z, r, spread, color, blend) {
   if (!sprites.circle) {
     initCircleSprite();
   }
-  drawCircleInternal(sprites.circle, x, y, z, r, spread, 0, 0, 1, 1, color);
+  drawCircleInternal(sprites.circle, x, y, z, r, spread, 0, 0, 1, 1, color, blend);
 }
 
-export function drawHollowCircle(x, y, z, r, spread, color) {
+export function drawHollowCircle(x, y, z, r, spread, color, blend) {
   if (!sprites.hollow_circle) {
     const CIRCLE_SIZE = 128;
     const LINE_W = 2;
@@ -1270,56 +1476,154 @@ export function drawHollowCircle(x, y, z, r, spread, color) {
       format: textures.format.R8,
       data,
       filter_min: gl.LINEAR,
-      filter_max: gl.LINEAR,
+      filter_mag: gl.LINEAR,
       wrap_s: gl.CLAMP_TO_EDGE,
       wrap_t: gl.CLAMP_TO_EDGE,
       origin: vec2(0.5, 0.5),
     });
   }
-  drawCircleInternal(sprites.hollow_circle, x, y, z, r, spread, 0, 0, 1, 1, color);
+  drawCircleInternal(sprites.hollow_circle, x, y, z, r, spread, 0, 0, 1, 1, color, blend);
 }
 
-export function drawLine(x0, y0, x1, y1, z, w, spread, color) {
-  if (!sprites.line) {
-    const LINE_SIZE=32;
-    let data = new Uint8Array(LINE_SIZE*LINE_SIZE);
-    let midp = (LINE_SIZE - 1) / 2;
-    for (let i = 0; i < LINE_SIZE; i++) {
-      for (let j = 0; j < LINE_SIZE; j++) {
-        let d = abs((i - midp) / midp);
-        let v = clamp(1 - d, 0, 1);
-        data[i + j*LINE_SIZE] = v * 255;
+
+const LINE_TEX_W=16;
+const LINE_TEX_H=16; // Only using 15, so we can have a value of 255 in the middle
+const LINE_MIDP = floor((LINE_TEX_H - 1) / 2);
+const LINE_V0 = 0.5/LINE_TEX_H;
+const LINE_V1 = 1-1.5/LINE_TEX_H;
+const LINE_U0 = 0.5/LINE_TEX_W;
+const LINE_U1 = (LINE_MIDP + 0.5) / LINE_TEX_W;
+const LINE_U2 = 1 - LINE_U1; // 1 texel away from LINE_U1
+const LINE_U3 = 1 - 0.5/LINE_TEX_W;
+export function drawLine(x0, y0, x1, y1, z, w, precise, color, mode) {
+  if (mode === undefined) {
+    mode = default_line_mode;
+  }
+  let tex_key = mode & LINE_CAP_ROUND ? 'line3' : 'line2';
+  if (!sprites[tex_key]) {
+    let data = new Uint8Array(LINE_TEX_W * LINE_TEX_H);
+    let i1 = LINE_MIDP;
+    let i2 = LINE_TEX_W - 1 - LINE_MIDP;
+    if (tex_key === 'line2') {
+      // rectangular caps
+      for (let j = 0; j < LINE_TEX_H; j++) {
+        let d = abs((j - LINE_MIDP) / LINE_MIDP);
+        let j_value = round(clamp(1 - d, 0, 1) * 255);
+        for (let i = 0; i < LINE_TEX_W; i++) {
+          d = i < i1 ? i/LINE_MIDP : i >= i2 ? 1 - (i-i2) / LINE_MIDP : 1;
+          let i_value = round(clamp(d, 0, 1) * 255);
+          data[i + j*LINE_TEX_W] = min(i_value, j_value);
+        }
+      }
+    } else {
+      // round caps
+      for (let j = 0; j < LINE_TEX_H; j++) {
+        let d = abs((j - LINE_MIDP) / LINE_MIDP);
+        for (let i = 0; i < LINE_TEX_W; i++) {
+          let id = i < i1 ? 1-i/LINE_MIDP : i >= i2 ? (i-i2) / LINE_MIDP : 0;
+          let dv = sqrt(id*id + d*d);
+          dv = clamp(1-dv, 0, 1);
+          data[i + j*LINE_TEX_W] = round(dv * 255);
+        }
       }
     }
-    sprites.line = glov_sprites.create({
-      url: 'line',
-      width: LINE_SIZE, height: LINE_SIZE,
+    sprites[tex_key] = glov_sprites.create({
+      url: tex_key,
+      width: LINE_TEX_W, height: LINE_TEX_H,
       format: textures.format.R8,
       data,
       filter_min: gl.LINEAR,
-      filter_max: gl.LINEAR,
+      filter_mag: gl.LINEAR,
       wrap_s: gl.CLAMP_TO_EDGE,
       wrap_t: gl.CLAMP_TO_EDGE,
-      origin: vec2(0.5, 0.5),
     });
   }
+  let texs = sprites[tex_key].texs;
+
+  const camera_xscale = camera2d.data[4];
+  const camera_yscale = camera2d.data[5];
+  let virtual_to_pixels = (camera_xscale + camera_yscale) * 0.5;
+  let pixels_to_virutal = 1/virtual_to_pixels;
+  let w_in_pixels = w * virtual_to_pixels;
+  let draw_w_pixels = w_in_pixels + 2*2;
+  let half_draw_w_pixels = draw_w_pixels * 0.5;
+  let draw_w = half_draw_w_pixels * pixels_to_virutal;
+  // let tex_delta_for_pixel = 1 / draw_w_pixels; // should be 51/255 for width=1 (draw_w_pixels = 5)
 
   let dx = x1 - x0;
   let dy = y1 - y0;
-  let length = Math.sqrt(dx*dx + dy*dy);
+  let length = sqrt(dx*dx + dy*dy);
   dx /= length;
   dy /= length;
-  let tangx = -dy * w;
-  let tangy = dx * w;
+  let tangx = -dy * draw_w;
+  let tangy = dx * draw_w;
 
-  glov_sprites.queueraw4(sprites.line.texs,
-    x0 + tangx, y0 + tangy,
+  if (mode & LINE_ALIGN) {
+    // align drawing so that the edge of the line is aligned with a pixel edge
+    //   (avoids a 0.1,1.0,0.1 line drawing in favor of 1.0,0.2, which will be crisper, if slightly visually offset)
+    let y0_real = (y0 - camera2d.data[1]) * camera2d.data[5];
+    let y0_real_aligned = round(y0_real - half_draw_w_pixels) + half_draw_w_pixels;
+    let yoffs = (y0_real_aligned - y0_real) / camera2d.data[5];
+    y0 += yoffs;
+    y1 += yoffs;
+
+    let x0_real = (x0 - camera2d.data[0]) * camera2d.data[4];
+    let x0_real_aligned = round(x0_real - half_draw_w_pixels) + half_draw_w_pixels;
+    let xoffs = (x0_real_aligned - x0_real) / camera2d.data[4];
+    x0 += xoffs;
+    x1 += xoffs;
+  }
+
+  let tex_delta_for_pixel = 2/draw_w_pixels;
+  let step_start = 1 - (w_in_pixels + 1) / draw_w_pixels;
+  let step_end = step_start + tex_delta_for_pixel;
+  step_end = 1 + precise * (step_end - 1);
+  let A = 1.0 / (step_end - step_start);
+  let B = -step_start * A;
+  let shader_param = { param0: [A, B] };
+
+  glov_sprites.queueraw4(texs,
     x1 + tangx, y1 + tangy,
     x1 - tangx, y1 - tangy,
     x0 - tangx, y0 - tangy,
+    x0 + tangx, y0 + tangy,
     z,
-    0, 0, 1, 1,
-    color, glov_font.font_shaders.font_aa, spreadTechParams(spread));
+    LINE_U1, LINE_V0, LINE_U2, LINE_V1,
+    color, glov_font.font_shaders.font_aa, shader_param);
+
+  if (mode & (LINE_CAP_ROUND|LINE_CAP_SQUARE)) {
+    // round caps (line3) - square caps (line2)
+    let nx = dx * w/2;
+    let ny = dy * w/2;
+    glov_sprites.queueraw4(texs,
+      x1 - tangx, y1 - tangy,
+      x1 + tangx, y1 + tangy,
+      x1 + tangx + nx, y1 + tangy + ny,
+      x1 - tangx + nx, y1 - tangy + ny,
+      z,
+      LINE_U2, LINE_V1, LINE_U3, LINE_V0,
+      color, glov_font.font_shaders.font_aa, shader_param);
+    glov_sprites.queueraw4(texs,
+      x0 - tangx, y0 - tangy,
+      x0 + tangx, y0 + tangy,
+      x0 + tangx - nx, y0 + tangy - ny,
+      x0 - tangx - nx, y0 - tangy - ny,
+      z,
+      LINE_U1, LINE_V1, LINE_U0, LINE_V0,
+      color, glov_font.font_shaders.font_aa, shader_param);
+  }
+}
+
+export function drawHollowRect(x0, y0, x1, y1, z, w, precise, color, mode) {
+  drawLine(x0, y0, x1, y0, z, w, precise, color, mode);
+  drawLine(x1, y0, x1, y1, z, w, precise, color, mode);
+  drawLine(x1, y1, x0, y1, z, w, precise, color, mode);
+  drawLine(x0, y1, x0, y0, z, w, precise, color, mode);
+}
+
+export function drawHollowRect2(param) {
+  drawHollowRect(param.x, param.y, param.x + param.w, param.y + param.h,
+    param.z || Z.UI, param.line_width || 1, param.precise || 1, param.color || unit_vec);
 }
 
 export function drawCone(x0, y0, x1, y1, z, w0, w1, spread, color) {
@@ -1348,7 +1652,7 @@ export function drawCone(x0, y0, x1, y1, z, w0, w1, spread, color) {
       format: textures.format.R8,
       data,
       filter_min: gl.LINEAR,
-      filter_max: gl.LINEAR,
+      filter_mag: gl.LINEAR,
       wrap_s: gl.CLAMP_TO_EDGE,
       wrap_t: gl.CLAMP_TO_EDGE,
       origin: vec2(0.5, 0.5),
@@ -1356,7 +1660,7 @@ export function drawCone(x0, y0, x1, y1, z, w0, w1, spread, color) {
   }
   let dx = x1 - x0;
   let dy = y1 - y0;
-  let length = Math.sqrt(dx*dx + dy*dy);
+  let length = sqrt(dx*dx + dy*dy);
   dx /= length;
   dy /= length;
   let tangx = -dy;

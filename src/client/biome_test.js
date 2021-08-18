@@ -2,7 +2,7 @@
 // Code provided for example purposes only with no license for use or distribution
 const assert = require('assert');
 const { abs } = Math;
-const { randCreate } = require('./glov/rand_alea.js');
+const { randCreate } = require('glov/rand_alea.js');
 
 const { C_WATER, C_PLAINS, C_HILLS, C_MOUNTAINS, C_RIVER_DELTA } = require('./proc_gen_constants.js');
 

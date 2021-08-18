@@ -7,12 +7,14 @@ const camera2d = require('./camera2d.js');
 const glov_engine = require('./engine.js');
 const glov_input = require('./input.js');
 const glov_font = require('./font.js');
+const { scrollAreaCreate } = require('./scroll_area.js');
+const { clipped, clipPause, clipResume } = require('./sprites.js');
 const glov_ui = require('./ui.js');
-const { vec4 } = require('./vmath.js');
+const { vec4 } = require('glov/vmath.js');
 let glov_markup = null; // Not ported
 
 const { min, max, sin } = Math;
-const { cloneShallow, merge, nearSame } = require('../../common/util.js');
+const { cloneShallow, merge, nearSame } = require('glov/util.js');
 
 let font;
 
@@ -77,6 +79,7 @@ export class GlovMenuItem {
     this.value_max = 0;
     this.value_inc = 0;
     this.tag = params.tag || null; // for isSelected(tag)
+    this.style = params.style || null;
     // was bitmask
     this.exit = Boolean(params.exit);
     this.prompt_int = Boolean(params.prompt_int);
@@ -125,7 +128,12 @@ class GlovSelectionBox {
     this.bounce_time = 0;
     this.expected_frame_index = 0;
     this.pre_dropdown_selection = undefined;
-    // this.sa = TODO
+    if (this.is_dropdown || this.scroll_height) {
+      this.sa = scrollAreaCreate({
+        focusable_elem: this,
+        //background_color: null,
+      });
+    }
   }
 
   applyParams(params) {
@@ -171,6 +179,11 @@ class GlovSelectionBox {
     return list_height + 3;
   }
 
+  focus() {
+    glov_ui.focusSteal(this);
+    this.is_focused = true;
+  }
+
   run(params) {
     this.applyParams(params);
     let { x, y, z, width, font_height, entry_height, auto_reset } = this;
@@ -190,6 +203,10 @@ class GlovSelectionBox {
           }
         }
       }
+    }
+
+    if (this.pre_dropdown_selection !== undefined && this.pre_dropdown_selection > this.items.length) {
+      this.pre_dropdown_selection = undefined;
     }
 
     let y0 = y;
@@ -213,7 +230,9 @@ class GlovSelectionBox {
     let focused = this.is_focused = this.disabled ? false : glov_ui.focusCheck(this);
     let gained_focus = focused && !was_focused;
 
-    if (!focused && this.dropdown_visible) {
+    if (this.dropdown_visible && (!focused ||
+      focused && glov_input.keyDownEdge(KEYS.ESC)
+    )) {
       if (this.pre_dropdown_selection !== undefined) {
         // Restore selection to before opening the dropdown
         this.selected = this.pre_dropdown_selection;
@@ -267,7 +286,11 @@ class GlovSelectionBox {
       }
     }
 
-    let page_size = (this.scroll_height - 1) / entry_height;
+    let scroll_height = this.scroll_height;
+    if (!scroll_height && this.is_dropdown) {
+      scroll_height = camera2d.y1() - (y + entry_height);
+    }
+    let page_size = (scroll_height - 1) / entry_height;
 
     if (focused) {
       let pad_shift = glov_input.padButtonDown(PAD.RIGHT_TRIGGER) || glov_input.padButtonDown(PAD.LEFT_TRIGGER);
@@ -313,6 +336,14 @@ class GlovSelectionBox {
         this.mouse_mode = false;
         pos_changed = true;
       }
+      if (glov_input.keyDownEdge(KEYS.SPACE) || glov_input.keyDownEdge(KEYS.ENTER)) {
+        if (!this.is_dropdown || this.dropdown_visible) {
+          this.was_clicked = true;
+        } else {
+          this.dropdown_visible = !this.dropdown_visible;
+          this.pre_dropdown_selection = this.selected;
+        }
+      }
     }
 
     let sel_changed = false;
@@ -351,43 +382,45 @@ class GlovSelectionBox {
 
     let dropdown_x = x;
     let dropdown_y = y;
+    let clip_pause = clipped() && this.is_dropdown && this.dropdown_visible;
+    if (clip_pause) {
+      clipPause();
+    }
+    let z_save = z;
     if (this.is_dropdown) {
-      z += 1000; // drop-down part should be above everything
+      z += 1000; // drop-down part should be above everything except tooltips
     }
 
     if (!this.is_dropdown || this.dropdown_visible) {
-      let do_scroll = this.scroll_height && this.items.length * entry_height > this.scroll_height;
-      if (!do_scroll && y + this.items.length * entry_height >= camera2d.y1()) {
+      let do_scroll = scroll_height && this.items.length * entry_height > scroll_height;
+      let extra_height = this.is_dropdown ? entry_height : 0;
+      if (!do_scroll && y + this.items.length * entry_height + extra_height >= camera2d.y1()) {
         y = camera2d.y1() - this.items.length * entry_height;
+      } else {
+        y += extra_height;
       }
       let y_save = y;
       let x_save = x;
       let scroll_pos = 0;
       let eff_width = width;
       if (do_scroll) {
-        // this.sa.display = &scroll_area_no_background;
         if (pos_changed) {
           // ensure part of visible scroll area includes the current selection
-          let buffer = min(1.5 * entry_height, (this.scroll_height - entry_height) / 2);
-          let min_scroll_pos = max(0, this.selected * entry_height - buffer);
-          let old_scroll_pos = this.sa.scroll_pos;
-          if (min_scroll_pos < this.sa.scroll_pos) {
-            this.sa.scroll_pos = min_scroll_pos;
-          }
-          let max_scroll_pos = min(this.items.length * entry_height,
-            (this.selected + 1) * entry_height + buffer) - this.scroll_height;
-          if (max_scroll_pos > this.sa.scroll_pos) {
-            this.sa.scroll_pos = max_scroll_pos;
-          }
-          // Make it smooth/bouncy a bit
-          this.sa.overscroll = old_scroll_pos - this.sa.scroll_pos;
+          let buffer = min(1.5 * entry_height, (scroll_height - entry_height) / 2);
+          this.sa.scrollIntoFocus(this.selected * entry_height - buffer,
+            min(this.items.length * entry_height,
+              (this.selected + 1) * entry_height + buffer),
+            scroll_height);
         }
-        this.sa.begin(x, y, z, width, this.scroll_height, color_white);
+        this.sa.begin({
+          x, y, z,
+          w: width,
+          h: scroll_height,
+        });
         scroll_pos = this.sa.scroll_pos + this.sa.overscroll;
         y = 0;
         x = 0;
-        // extern float glov_scrollbar_scale;
-        // eff_width = width - glov_ui_scrollbar_top.GetTileWidth() * glov_scrollbar_scale;
+        eff_width = width - this.sa.barWidth();
       }
       for (let i = 0; i < this.items.length; i++) {
         let item = this.items[i];
@@ -401,8 +434,8 @@ class GlovSelectionBox {
           this.mouse_mode = true;
           this.selected = i;
         }
-        if (!this.disabled && !entry_disabled &&glov_input.click({
-          x, y, w: width, h: entry_height
+        if (!this.disabled && !entry_disabled && glov_input.click({
+          x, y, w: width, h: entry_height, button: 1,
         })) {
           glov_ui.focusSteal(this);
           this.was_right_clicked = true;
@@ -433,7 +466,9 @@ class GlovSelectionBox {
         }
 
         let style;
-        let show_selection = !this.disabled && (!(this.transient_focus && !this.is_focused) || is_mouseover);
+        let show_selection = !this.disabled && (
+          !(this.transient_focus && !this.is_focused) && !this.is_dropdown || // show if a non-dropdown that's focused
+          is_mouseover || !this.mouse_mode);
         let bounce = false;
         if (this.selected === i && show_selection) {
           style = display.style_selected || selbox_font_style_selected;
@@ -461,7 +496,7 @@ class GlovSelectionBox {
           style = display.style_disabled || selbox_font_style_disabled;
           image_set = glov_ui.sprites.menu_entry;
         } else {
-          style = display.style_default || selbox_font_style_default;
+          style = item.style || display.style_default || selbox_font_style_default;
           image_set = glov_ui.sprites.menu_entry;
         }
         let yoffs = 0;
@@ -537,7 +572,7 @@ class GlovSelectionBox {
       }
       if (do_scroll) {
         this.sa.end(y);
-        y = y_save + this.scroll_height;
+        y = y_save + scroll_height;
         x = x_save;
       }
 
@@ -546,8 +581,12 @@ class GlovSelectionBox {
       }
     }
 
+    if (clip_pause) {
+      clipResume();
+    }
+
     if (this.is_dropdown) {
-      z -= 1000;
+      z = z_save;
       x = dropdown_x;
       y = dropdown_y;
       // display header
@@ -561,11 +600,15 @@ class GlovSelectionBox {
       //   entry_height;
       // let dropdown_x = x + width - dropdown_width;
       //int dropdown_w = glov_ui_menu_header.right.GetTileWidth();
-      if (!this.disabled && glov_input.click({
-        x, y,
-        w: width, h: entry_height
-      })) {
+      let dropdown_param = {
+        x, y, z: z + 2 - 0.1,
+        w: width, h: entry_height,
+        disabled: this.disabled,
+      };
+      let clicked = false;
+      if (!this.disabled && glov_input.click(dropdown_param)) {
         glov_ui.focusSteal(this);
+        clicked = true;
         this.dropdown_visible = !this.dropdown_visible;
         this.pre_dropdown_selection = this.selected;
         color0 = color_grayD0;
@@ -577,6 +620,7 @@ class GlovSelectionBox {
         color0 = color_grayD0;
         // color1 = color_gray80;
       }
+      glov_ui.checkHooks(dropdown_param, clicked);
       glov_ui.drawHBox({
         x, y, z: z + 1,
         w: width, h: entry_height
@@ -584,11 +628,16 @@ class GlovSelectionBox {
       // glov_ui.draw_list.queue(glov_ui.sprites.menu_header,
       //   dropdown_x, y, z + 1.5, color1, [dropdown_width, entry_height, 1, 1],
       //   glov_ui.sprites.menu_header.uidata.rects[2]);
+      let eff_selection = this.is_dropdown && this.dropdown_visible && this.pre_dropdown_selection !== undefined ?
+        this.pre_dropdown_selection :
+        this.selected;
+      let align = (display.centered ? glov_font.ALIGN.HCENTER : glov_font.ALIGN.HLEFT) |
+        glov_font.ALIGN.HFIT | glov_font.ALIGN.VCENTER;
       font.drawSizedAligned(focused ? glov_ui.font_style_focused : glov_ui.font_style_normal,
         x + display.xpad, y, z + 2,
-        font_height, glov_font.ALIGN.HFIT | glov_font.ALIGN.VCENTER, // eslint-disable-line no-bitwise
+        font_height, align,
         width - display.xpad - glov_ui.sprites.menu_header.uidata.wh[2] * entry_height, entry_height,
-        this.items[this.selected].name);
+        this.items[eff_selection].name);
       y += entry_height;
       yret = y + 2;
     }

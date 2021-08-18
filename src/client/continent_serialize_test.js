@@ -5,8 +5,8 @@
 //   better.
 
 const assert = require('assert');
-const { packetCreate } = require('../common/packet.js');
-const { ridx } = require('../common/util.js');
+const { packetCreate } = require('glov/packet.js');
+const { ridx } = require('glov/util.js');
 const {
   encodeRLEZeroes,
   encodeRLEU2,

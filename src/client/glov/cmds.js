@@ -1,26 +1,17 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
-const cmd_parse_mod = require('../../common/cmd_parse.js');
+const cmd_parse_mod = require('glov/cmd_parse.js');
 const local_storage = require('./local_storage.js');
 export let cmd_parse = cmd_parse_mod.create({ storage: local_storage });
 
 const engine = require('./engine.js');
+const net = require('./net.js');
 const textures = require('./textures.js');
-const { PI, round } = Math;
 
 window.cmd = function (str) {
   cmd_parse.handle(null, str, cmd_parse_mod.defaultHandler);
 };
-
-cmd_parse.registerValue('fov', {
-  type: cmd_parse.TYPE_FLOAT,
-  label: 'FOV',
-  range: [1,179],
-  get: () => round(engine.fov_min * 180 / PI),
-  set: (v) => engine.setFOV(v * PI / 180),
-  store: true,
-});
 
 function byteFormat(bytes) {
   if (bytes > 850000) {
@@ -57,7 +48,14 @@ cmd_parse.register({
   cmd: 'd',
   help: 'Toggles a debug define',
   func: function (str, resp_func) {
-    str = str.toUpperCase();
+    str = str.toUpperCase().trim();
+    if (!str) {
+      for (let key in engine.defines) {
+        engine.defines[key] = false;
+      }
+      engine.definesChanged();
+      return void resp_func(null, 'All debug defines cleared');
+    }
     engine.defines[str] = !engine.defines[str];
     resp_func(null, `D=${str} now ${engine.defines[str]?'SET':'unset'}`);
     engine.definesChanged();
@@ -69,6 +67,25 @@ cmd_parse.register({
   help: 'Displays current renderer',
   func: function (str, resp_func) {
     resp_func(null, `Renderer=WebGL${engine.webgl2?2:1}`);
+  }
+});
+
+cmd_parse.register({
+  cmd: 'csr',
+  access_run: ['sysadmin'],
+  help: '(Admin) Run a command as another user',
+  usage: '$HELP\n  /csr UserID command\n' +
+    'Example: /csr jimbly gems -100',
+  func: function (str, resp_func) {
+    let idx = str.indexOf(' ');
+    if (idx === -1) {
+      return void resp_func('Invalid number of arguments');
+    }
+    let user_id = str.slice(0, idx);
+    let cmd = str.slice(idx + 1);
+    let pak = net.subs.getChannelImmediate(`user.${user_id}`).pak('csr_admin_to_user');
+    pak.writeString(cmd);
+    pak.send(resp_func);
   }
 });
 
@@ -119,6 +136,11 @@ cmd_parse.registerValue('safe_area', {
       }
     } else {
       // error, ignore?
+    }
+    for (let ii = 0; ii < 4; ++ii) {
+      if (!isFinite(safearea[ii])) {
+        safearea[ii] = -1;
+      }
     }
   },
   store: true,

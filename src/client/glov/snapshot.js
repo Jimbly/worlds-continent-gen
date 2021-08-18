@@ -7,7 +7,8 @@ const camera2d = require('./camera2d.js');
 const { alphaDraw, alphaDrawListSize, alphaListPush, alphaListPop } = require('./draw_list.js');
 const effects = require('./effects.js');
 const engine = require('./engine.js');
-const mat4LookAt = require('gl-mat4/lookat');
+const { framebufferCapture } = require('./framebuffer.js');
+const mat4LookAt = require('gl-mat4/lookAt');
 const { max, PI, tan } = Math;
 const shaders = require('./shaders.js');
 const sprites = require('./sprites.js');
@@ -20,7 +21,7 @@ const {
   vec4,
   v4copy,
   zaxis,
-} = require('./vmath.js');
+} = require('glov/vmath.js');
 const {
   qRotateZ,
   qTransformVec3,
@@ -114,7 +115,7 @@ export function snapshot(param) {
 
   if (param.snapshot_backdrop) {
     gl.depthMask(false);
-    effects.applyCopy({ source: param.snapshot_backdrop });
+    effects.applyCopy({ source: param.snapshot_backdrop, no_framebuffer: true });
     gl.depthMask(true);
   }
   param.draw();
@@ -122,13 +123,14 @@ export function snapshot(param) {
     alphaDraw();
     gl.depthMask(true);
   }
-  engine.captureFramebuffer(texs[0], param.w, param.h, true, false);
+  // TODO: use new framebuffer API here
+  framebufferCapture(texs[0], param.w, param.h, true, false);
 
   gl.clearColor(1, 1, 1, 0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   if (param.snapshot_backdrop) {
     gl.depthMask(false);
-    effects.applyCopy({ source: param.snapshot_backdrop });
+    effects.applyCopy({ source: param.snapshot_backdrop, no_framebuffer: true });
     gl.depthMask(true);
   }
   param.draw();
@@ -137,7 +139,7 @@ export function snapshot(param) {
     gl.depthMask(true);
   }
   // PERFTODO: we only need to capture the red channel, does that speed things up and use less mem?
-  engine.captureFramebuffer(texs[1], param.w, param.h, true, false);
+  framebufferCapture(texs[1], param.w, param.h, true, false);
 
   viewportRenderFinish(param);
 

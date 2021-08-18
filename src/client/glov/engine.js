@@ -5,15 +5,25 @@
 require('./bootstrap.js'); // Just in case it's not in app.js
 
 export let DEBUG = String(document.location).match(/^https?:\/\/localhost/);
+exports.require = require; // For browser console debugging
 
 require('not_worker'); // This module cannot be required from a worker bundle
 
 const assert = require('assert');
+const { is_ios_safari } = require('./browser.js');
 const camera2d = require('./camera2d.js');
 const cmds = require('./cmds.js');
 const effects = require('./effects.js');
+const { effectsReset, effectsTopOfFrame, effectsIsFinal, effectsPassAdd, effectsPassConsume } = effects;
+const {
+  errorReportDisable,
+  errorReportSetPath,
+  errorReportSetTimeAccum,
+  errorReportSetDetails,
+  glovErrorReport,
+} = require('./error_report.js');
 const glov_font = require('./font.js');
-const font_info_palanquin32 = require('../img/font/palanquin32.json');
+const { framebufferStart, framebufferEndOfFrame } = require('./framebuffer.js');
 const geom = require('./geom.js');
 const input = require('./input.js');
 const local_storage = require('./local_storage.js');
@@ -35,8 +45,11 @@ const { texturesTick } = textures;
 const glov_transition = require('./transition.js');
 const glov_ui = require('./ui.js');
 const urlhash = require('./urlhash.js');
-const { clamp, defaults, nearSame, ridx } = require('../../common/util.js');
-const { mat3, mat4, vec3, vec4, v3mulMat4, v3iNormalize, v4copy, v4same, v4set } = require('./vmath.js');
+const { callEach, clamp, defaults, nearSame, ridx } = require('glov/util.js');
+const {
+  mat3, mat4,
+  vec3, vec4, v3mulMat4, v3iNormalize, v4copy, v4same, v4set,
+} = require('glov/vmath.js');
 
 export let canvas;
 export let webgl2;
@@ -44,11 +57,16 @@ export let glov_particles;
 
 export let width;
 export let height;
+let width_3d;
+let height_3d;
 export let pixel_aspect = 1;
+export let dom_to_canvas_ratio = window.devicePixelRatio || 1;
 export let antialias;
+export let antialias_unavailable;
 
 export let game_width;
 export let game_height;
+let game_aspect;
 
 export let render_width;
 export let render_height;
@@ -56,12 +74,10 @@ export let render_height;
 //eslint-disable-next-line no-use-before-define
 export let defines = urlhash.register({ key: 'D', type: urlhash.TYPE_SET, change: definesChanged });
 
-export let any_3d = false;
 export let ZFAR;
 export let ZNEAR;
 export let fov_y = 1;
 export let fov_x = 1;
-export let fov_min = 60 * PI / 180;
 
 export let mat_projection = mat4();
 export let mat_view = mat4();
@@ -72,7 +88,7 @@ let mat_mv_no_skew = mat4();
 let mat_mvp = mat4();
 let mat_mv_inv_transform = mat3();
 let mat_inv_view = mat3();
-let projection_inverse = vec4();
+// let projection_inverse = vec4();
 
 export let light_diffuse = vec3(0.75, 0.75, 0.75);
 let light_dir_vs = vec3(0, 0, 0);
@@ -82,6 +98,15 @@ export let light_dir_ws = vec3(-1, -2, -3);
 export let font;
 export let app_state = null;
 export const border_color = vec4(0, 0, 0, 1);
+
+let no_render = false;
+
+export function disableRender(new_value) {
+  no_render = new_value;
+  if (no_render) {
+    glov_ui.cleanupDOMElems();
+  }
+}
 
 let mat_temp = mat4();
 export function setGlobalMatrices(_mat_view) {
@@ -93,24 +118,42 @@ export function setGlobalMatrices(_mat_view) {
   mat3FromMat4(mat_inv_view, mat_temp);
 }
 
-export function setFOV(new_fov) {
-  fov_min = new_fov;
+// Just set up mat_vp and mat_projection
+export function setMatVP(_mat_view) {
+  // eslint-disable-next-line no-use-before-define
+  setupProjection(fov_y, width_3d, height_3d, ZNEAR, ZFAR);
+  mat4Copy(mat_view, _mat_view);
+  mat4Mul(mat_vp, mat_projection, mat_view);
+}
+
+export function setFOV(fov_min) {
+  let w = width_3d;
+  let h = height_3d;
+  let aspect = w / h;
+  if (aspect > game_aspect) {
+    fov_y = fov_min;
+    let rise = sin(fov_y / 2) / cos(fov_y / 2) * aspect;
+    fov_x = 2 * asin(rise / sqrt(rise * rise + 1));
+  } else {
+    // Calculate what fov_x would be if the screen was game_aspect, then derive fov_y from that
+    let rise = sin(fov_min / 2) / cos(fov_min / 2) * game_aspect;
+    fov_x = 2 * asin(rise / sqrt(rise * rise + 1));
+    // Old method, just apply fov to x (it's the same thing, if game_aspect is 1.0)
+    // fov_x = fov_min;
+    let rise2 = sin(fov_x / 2) / cos(fov_x / 2) / aspect;
+    fov_y = 2 * asin(rise2 / sqrt(rise2 * rise2 + 1));
+  }
 }
 
 export function setGameDims(w, h) {
   game_width = w;
   game_height = h;
+  game_aspect = game_width / game_height;
 }
 
-let is_ios_safari = (function () {
-  let ua = window.navigator.userAgent;
-  let is_ios = ua.match(/iPad/i) || ua.match(/iPhone/i);
-  let webkit = ua.match(/WebKit/i);
-  return is_ios && webkit && !ua.match(/CriOS/i);
-}());
-
 // Didn't need this for a while, but got slow on iOS recently :(
-const postprocessing_reset_version = '4';
+// Better when using FBOs for postprocessing now, though!
+const postprocessing_reset_version = '5';
 export let postprocessing = local_storage.get('glov_no_postprocessing') !== postprocessing_reset_version;
 export function postprocessingAllow(allow) {
   local_storage.set('glov_no_postprocessing', allow ? undefined : postprocessing_reset_version);
@@ -138,13 +181,21 @@ export function releaseCanvas() {
   }
 }
 
-let error_report_disabled = false;
 export function reloadSafe() {
   // Do not report any errors after this point
-  error_report_disabled = true;
+  errorReportDisable();
   // Release canvas to not leak memory on Firefox
   releaseCanvas();
-  document.location.reload();
+  if (window.FBInstant) {
+    try {
+      window.top.location.reload();
+    } catch (e) {
+      // Not good, but better than the alternatives, I guess
+      window.FBInstant.quit();
+    }
+  } else {
+    document.location.reload();
+  }
 }
 window.reloadSafe = reloadSafe;
 
@@ -271,8 +322,7 @@ perf.addMetric({
     vec4(1, 0.925, 0.153, 1), // cpu/tick time
     vec4(0, 0.894, 0.212, 1), // total time (GPU)
   ],
-  interactable: DEBUG,
-});
+}, true);
 
 let do_borders = true;
 let do_viewport_postprocess = false;
@@ -295,21 +345,24 @@ export function postTick(opts) {
   post_tick.push(opts);
 }
 
-let temporary_textures = {};
+let post_render = null;
+export function postRender(fn) {
+  if (!post_render) {
+    post_render = [];
+  }
+  post_render.push(fn);
+}
 
 function resetEffects() {
-  for (let key in temporary_textures) {
-    let temp = temporary_textures[key];
-    // Release unused textures
-    while (temp.list.length > temp.idx) {
-      temp.list.pop().destroy();
-    }
-    if (!temp.idx) {
-      delete temporary_textures[key];
-    } else {
-      temp.idx = 0;
-    }
-  }
+  effectsReset();
+  framebufferEndOfFrame();
+}
+
+export function renderWidth() {
+  return render_width || width;
+}
+export function renderHeight() {
+  return render_height || height;
 }
 
 const SAFARI_FULLSCREEN_ASPECT = (function () {
@@ -366,7 +419,8 @@ function checkResize() {
   // use VisualViewport on at least iOS Safari - deal with tabs and keyboard
   //   shrinking the viewport without changing the window height
   let vv = window.visualViewport || {};
-  let css_to_real = window.devicePixelRatio || 1;
+  dom_to_canvas_ratio = window.devicePixelRatio || 1;
+  dom_to_canvas_ratio *= settings.render_scale_all;
   let view_w = (vv.width || window.innerWidth);
   let view_h = (vv.height || window.innerHeight);
   if (view_h !== last_body_height) {
@@ -374,8 +428,9 @@ function checkResize() {
     last_body_height = view_h;
     document.body.style.height = `${view_h}px`;
   }
-  let new_width = round(canvas.clientWidth * css_to_real) || 1;
-  let new_height = round(canvas.clientHeight * css_to_real) || 1;
+  let rect = canvas.getBoundingClientRect();
+  let new_width = round(rect.width * dom_to_canvas_ratio) || 1;
+  let new_height = round(rect.height * dom_to_canvas_ratio) || 1;
 
   if (cmds.safearea[0] === -1) {
     if (safearea_elem) {
@@ -383,12 +438,13 @@ function checkResize() {
       let sa_height = safearea_elem.offsetHeight;
       if (sa_width && sa_height) {
         v4set(safearea_values,
-          safearea_elem.offsetLeft * css_to_real,
-          new_width - (sa_width + safearea_elem.offsetLeft) * css_to_real,
-          max(safearea_elem.offsetTop * css_to_real, safariTopSafeArea(view_w, view_h)),
+          safearea_elem.offsetLeft * dom_to_canvas_ratio,
+          new_width - (sa_width + safearea_elem.offsetLeft) * dom_to_canvas_ratio,
+          max(safearea_elem.offsetTop * dom_to_canvas_ratio,
+            safariTopSafeArea(view_w, view_h) * settings.render_scale_all),
           // Note: Possibly ignoring bottom safe area, it seems not useful on iPhones (does not
           //  adjust when keyboard is up, only obscured in the middle, if obeying left/right safe area)
-          safearea_ignore_bottom ? 0 : new_height - (sa_height + safearea_elem.offsetTop) * css_to_real);
+          safearea_ignore_bottom ? 0 : new_height - (sa_height + safearea_elem.offsetTop) * dom_to_canvas_ratio);
       }
     }
   } else {
@@ -405,9 +461,13 @@ function checkResize() {
   }
 
   if (new_width !== last_canvas_width || new_height !== last_canvas_height) {
-    window.pixel_scale = css_to_real; // for debug
+    window.pixel_scale = dom_to_canvas_ratio; // for debug
     last_canvas_width = canvas.width = new_width || 1;
     last_canvas_height = canvas.height = new_height || 1;
+
+    width = canvas.width;
+    height = canvas.height;
+
     // For the next 10 frames, make sure font size is correct
     need_repos = 10;
   }
@@ -422,43 +482,6 @@ export let viewport = vec4(0,0,1,1);
 export function setViewport(xywh) {
   v4copy(viewport, xywh);
   gl.viewport(xywh[0], xywh[1], xywh[2], xywh[3]);
-}
-
-let last_temp_idx = 0;
-export function getTemporaryTexture(w, h) {
-  let key = w ? `${w}_${h}` : 'screen';
-  let temp = temporary_textures[key];
-  if (!temp) {
-    temp = temporary_textures[key] = { list: [], idx: 0 };
-  }
-  if (temp.idx >= temp.list.length) {
-    let tex = textures.createForCapture(`temp_${key}_${++last_temp_idx}`);
-    temp.list.push(tex);
-  }
-  let tex = temp.list[temp.idx++];
-  return tex;
-}
-
-export function captureFramebuffer(tex, w, h, do_filter_linear, do_wrap) {
-  if (!w && render_width) {
-    w = render_width;
-    h = render_height;
-  }
-  if (!tex) {
-    tex = getTemporaryTexture(w, h);
-  }
-  if (w) {
-    tex.copyTexImage(viewport[0], viewport[1], w, h);
-  } else {
-    tex.copyTexImage(0, 0, width, height);
-  }
-  tex.setSamplerState({
-    filter_min: do_filter_linear ? gl.LINEAR : gl.NEAREST,
-    filter_mag: do_filter_linear ? gl.LINEAR : gl.NEAREST,
-    wrap_s: do_wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE,
-    wrap_t: do_wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE,
-  });
-  return tex;
 }
 
 let frame_requested = false;
@@ -487,37 +510,87 @@ function requestFrame() {
 let mat_projection_10;
 export let had_3d_this_frame;
 
+export function clearHad3DThisFrame() {
+  had_3d_this_frame = false;
+}
+
 export function setupProjection(use_fov_y, use_width, use_height, znear, zfar) {
   mat4Perspective(mat_projection, use_fov_y, use_width/use_height, znear, zfar);
   mat_projection_10 = mat_projection[10];
-  v4set(projection_inverse,
-    2 / (use_width * mat_projection[0]), // projection_matrix.m00),
-    2 / (use_height * mat_projection[5]), // projection_matrix.m11),
-    -(1 + mat_projection[8]) / mat_projection[0], // projection_matrix.m20) / projection_matrix.m00,
-    -(1 + mat_projection[9]) / mat_projection[5] // projection_matrix.m21) / projection_matrix.m11
-  );
+  // v4set(projection_inverse,
+  //   2 / (use_width * mat_projection[0]), // projection_matrix.m00),
+  //   2 / (use_height * mat_projection[5]), // projection_matrix.m11),
+  //   -(1 + mat_projection[8]) / mat_projection[0], // projection_matrix.m20) / projection_matrix.m00,
+  //   -(1 + mat_projection[9]) / mat_projection[5] // projection_matrix.m21) / projection_matrix.m11
+  // );
 }
 
 export function setZRange(znear, zfar) {
   ZNEAR = znear;
   ZFAR = zfar;
   if (had_3d_this_frame) {
-    setupProjection(fov_y, width, height, ZNEAR, ZFAR);
+    setupProjection(fov_y, width_3d, height_3d, ZNEAR, ZFAR);
   }
 }
 
-export function start3DRendering() {
+function set3DRenderResolution(w, h) {
+  width_3d = w;
+  height_3d = h;
+}
+
+let want_render_scale_3d_this_frame;
+let had_render_scale_3d_this_frame;
+export function start3DRendering(opts) {
+  opts = opts || {};
+  if (opts.width) {
+    set3DRenderResolution(opts.width, opts.height);
+  }
+  setFOV(opts.fov || (settings.fov * PI / 180));
   had_3d_this_frame = true;
+  if (!opts.width && want_render_scale_3d_this_frame && !defines.NOCOPY) {
+    had_render_scale_3d_this_frame = true;
+    effectsPassAdd();
+  }
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.enable(gl.BLEND);
   gl.enable(gl.DEPTH_TEST);
   gl.depthMask(true);
+  let backbuffer_width = width_3d;
+  let backbuffer_height = height_3d;
+  if (opts.viewport) {
+    // Rendering to a viewport within the backbuffer, and postprocessing must be
+    // UI-level and want to grab the whole thing.
+    backbuffer_width = render_width || width;
+    backbuffer_height = render_height || height;
+  }
+  framebufferStart({
+    width: backbuffer_width,
+    height: backbuffer_height,
+    final: effectsIsFinal(),
+    need_depth: opts.need_depth || true,
+    clear: true,
+    clear_all: opts.clear_all === undefined ? settings.render_scale_clear : opts.clear_all,
+    viewport: opts.viewport,
+  });
 
-  setupProjection(fov_y, width, height, ZNEAR, ZFAR);
+  setupProjection(fov_y, width_3d, height_3d, ZNEAR, ZFAR);
 
-  gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); // eslint-disable-line no-bitwise
   gl.enable(gl.CULL_FACE);
+}
+
+function renderScaleFinish() {
+  if (defines.NOCOPY) {
+    gl.disable(gl.SCISSOR_TEST);
+    v4set(viewport, 0, 0, width, height);
+    gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+  } else {
+    effectsPassConsume();
+    if (settings.render_scale_mode === 2) {
+      effects.applyPixelyExpand({ final: effectsIsFinal(), clear: false });
+    } else {
+      effects.applyCopy({ filter_linear: settings.render_scale_mode === 0 });
+    }
+  }
 }
 
 export function startSpriteRendering() {
@@ -545,6 +618,7 @@ function fixNatives(is_startup) {
   for (let a in b) {
     console[is_startup ? 'log' : 'error'](`Found invasive enumerable property "${a}" on Array.prototype, removing...`);
     let old_val = b[a];
+    errorReportSetDetails(`had_native_${a}`, typeof old_val);
     delete Array.prototype[a];
     // If this fails to work, perhaps try using Object.preventExtensions(Array.prototype) in an inline header script?
     // eslint-disable-next-line no-extend-native
@@ -554,6 +628,33 @@ function fixNatives(is_startup) {
     // Failed: code that iterates arrays will fail
     assert(false, `Array.prototype has unremovable member ${a}`);
   }
+}
+
+function resetState() {
+  // Only geom.geomResetState appears to have been strictly needed to work around
+  //  a bug on Chrome 71, but doing the rest of this to be safe.
+  textures.texturesResetState();
+  shaders.shadersResetState();
+  geom.geomResetState();
+
+  // These should already be true:
+  // gl.blendFunc(gl.ONE, gl.ONE);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  // gl.disable(gl.BLEND);
+  gl.enable(gl.BLEND);
+  // gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.DEPTH_TEST);
+  // gl.depthMask(false);
+  gl.depthMask(true);
+  // gl.disable(gl.CULL_FACE);
+  gl.enable(gl.CULL_FACE);
+  // gl.depthFunc(gl.GEQUAL);
+  gl.depthFunc(gl.LEQUAL);
+  // gl.enable(gl.SCISSOR_TEST);
+  gl.disable(gl.SCISSOR_TEST);
+  // gl.cullFace(gl.FRONT);
+  gl.cullFace(gl.BACK);
+  gl.viewport(0, 0, width, height);
 }
 
 export const hrnow = window.performance ? window.performance.now.bind(window.performance) : Date.now.bind(Date);
@@ -579,6 +680,7 @@ function tick(timestamp) {
   last_tick = now;
   frame_timestamp += dt;
   ++frame_index;
+  errorReportSetTimeAccum(frame_timestamp);
 
   fixNatives(false);
 
@@ -591,7 +693,7 @@ function tick(timestamp) {
   ++mspf_frame_count;
   mspf_tick_accum += last_tick_cpu;
   // net_time_accum += this_net_time;
-  if (now - mspf_update_time > 1000) {
+  if (now - mspf_update_time > settings.fps_window * 1000) {
     if (!mspf_update_time) {
       mspf_update_time = now;
     } else {
@@ -605,8 +707,11 @@ function tick(timestamp) {
     }
   }
 
-  if (document.hidden || document.webkitHidden) {
+  effectsTopOfFrame();
+
+  if (document.hidden || document.webkitHidden || no_render) {
     resetEffects();
+    input.tickInputInactive();
     last_tick_cpu = 0;
     for (let ii = post_tick.length - 1; ii >= 0; --ii) {
       if (post_tick[ii].inactive && !--post_tick[ii].ticks) {
@@ -618,27 +723,28 @@ function tick(timestamp) {
     return;
   }
 
-  had_3d_this_frame = false;
   checkResize();
-  width = canvas.width;
-  height = canvas.height;
-
-  if (any_3d) {
-    // setting the fov values for the frame even if we don't do 3D this frame, because something
-    // might need it before start3DRendering() (e.g. mouse click inverse projection)
-    if (width > height) {
-      fov_y = fov_min;
-      let rise = width/height * sin(fov_y / 2) / cos(fov_y / 2);
-      fov_x = 2 * asin(rise / sqrt(rise * rise + 1));
-    } else {
-      fov_x = fov_min;
-      let rise = height/width * sin(fov_x / 2) / cos(fov_x / 2);
-      fov_y = 2 * asin(rise / sqrt(rise * rise + 1));
+  had_3d_this_frame = false;
+  want_render_scale_3d_this_frame = false;
+  had_render_scale_3d_this_frame = false;
+  if (render_width) {
+    // render_scale not supported with render_width, doesn't make much sense, just use render_width
+    set3DRenderResolution(render_width, render_height);
+    effectsPassAdd();
+  } else {
+    width_3d = round(width * settings.render_scale);
+    height_3d = round(height * settings.render_scale);
+    if (width_3d !== width) {
+      want_render_scale_3d_this_frame = true;
     }
   }
+
+  resetState();
+
   textures.bind(0, textures.textures.error);
 
   camera2d.tickCamera2D();
+  glov_transition.render(dt);
   camera2d.setAspectFixed(game_width, game_height);
 
   soundTick(dt);
@@ -681,14 +787,32 @@ function tick(timestamp) {
   }
 
   glov_particles.tick(dt); // *after* app_tick, so newly added/killed particles can be queued into the draw list
-  glov_transition.render(dt);
 
-  if (!had_3d_this_frame) {
+  if (had_3d_this_frame) {
+    if (had_render_scale_3d_this_frame) {
+      renderScaleFinish();
+    }
+  } else {
     // delayed clear (and general GL init) until after app_state, app might change clear color
-    gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-    // TODO: for do_viewport_post_process, we need to enable gl.scissor to avoid clearing the whole screen!
-    // gl.scissor(0, 0, viewport[2] - viewport[0], viewport[3] - viewport[1]);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (render_width) {
+      // assert(!effectsIsFinal());
+      framebufferStart({
+        width: render_width,
+        height: render_height,
+        clear: true,
+        clear_all: settings.render_scale_clear, // Not sure if this is ever faster in this case?
+        final: effectsIsFinal(),
+        need_depth: false,
+      });
+    } else {
+      framebufferStart({
+        width,
+        height,
+        clear: true,
+        final: effectsIsFinal(),
+        need_depth: false,
+      });
+    }
   }
 
   startSpriteRendering();
@@ -696,23 +820,27 @@ function tick(timestamp) {
 
   glov_ui.endFrame();
 
+  if (post_render) {
+    callEach(post_render, post_render = null);
+  }
+
   if (render_width) {
-    let source = captureFramebuffer();
+    effectsPassConsume();
     let clear_color = [0, 0, 0, 1];
     let final_viewport = [
       camera2d.render_offset_x, camera2d.render_offset_y_bottom,
       camera2d.render_viewport_w, camera2d.render_viewport_h
     ];
+    let params = {
+      clear: true,
+      clear_all: true,
+      clear_color: clear_color,
+      viewport: final_viewport,
+    };
     if (do_viewport_postprocess) {
-      effects.applyPixelyExpand({ source, final_viewport, clear_color });
+      effects.applyPixelyExpand(params);
     } else {
-      if (clear_color) {
-        gl.clearColor(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-      }
-      setViewport(final_viewport);
-      // gl.scissor(0, 0, width, height);
-      effects.applyCopy({ source });
+      effects.applyCopy(params);
     }
   }
 
@@ -732,55 +860,25 @@ function tick(timestamp) {
   requestFrame();
 }
 
-let error_report_details = {};
-let error_report_details_str = '';
-export function setErrorReportDetails(key, value) {
-  if (value) {
-    error_report_details[key] = escape(String(value));
-  } else {
-    delete error_report_details[key];
-  }
-  error_report_details_str = `&${Object.keys(error_report_details)
-    .map((k) => `${k}=${error_report_details[k]}`)
-    .join('&')}`;
-}
-setErrorReportDetails('ver', BUILD_TIMESTAMP);
-let last_error_time = 0;
-let crash_idx = 0;
-// Errors from plugins that we don't want to get reported to us, or show the user!
-let filtered_errors = /avast_submit|vc_request_action/;
-function glovErrorReport(msg, file, line, col) {
-  ++crash_idx;
-  let now = Date.now();
-  setTimeout(requestFrame, 1);
-  let dt = now - last_error_time;
-  last_error_time = now;
-  if (error_report_disabled) {
-    return false;
-  }
-  if (dt < 30*1000) {
-    // Less than 30 seconds since the last error, either we're erroring every
-    // frame, or this is a secondary error caused by the first, do not report it.
-    // Could maybe hash the error message and just report each message once, and
-    // flag errors as primary or secondary.
-    return false;
-  }
-  if (msg.match(filtered_errors)) {
-    return false;
-  }
-  // Post to an error reporting endpoint that (probably) doesn't exist - it'll get in the logs anyway!
-  let url = urlhash.getAPIPath(); // base like http://foo.com/bar/ (without index.html)
-  url += `errorReport?cidx=${crash_idx}&file=${escape(file)}&line=${line}&col=${col}&url=${escape(location.href)}` +
-    `&msg=${escape(msg)}${error_report_details_str}`;
-  let xhr = new XMLHttpRequest();
-  xhr.open('POST', url, true);
-  xhr.send(null);
-  return true;
-}
-
 function periodiclyRequestFrame() {
   requestFrame();
   setTimeout(periodiclyRequestFrame, 5000);
+}
+
+// Must be called out-of-frame (use setTimeout) if not at startup
+export function setPixelyStrict(on) {
+  if (on) {
+    render_width = game_width;
+    render_height = game_height;
+  } else {
+    render_width = undefined;
+    render_height = undefined;
+  }
+}
+
+export function setFonts(new_font, title_font) {
+  font = new_font;
+  glov_ui.setFonts(new_font, title_font);
 }
 
 export function startup(params) {
@@ -790,7 +888,11 @@ export function startup(params) {
   safearea_elem = document.getElementById('safearea');
 
   if (params.error_report !== false) {
-    window.glov_error_report = glovErrorReport;
+    errorReportSetPath(urlhash.getAPIPath());
+    window.glov_error_report = (msg, file, line, col) => {
+      setTimeout(requestFrame, 1);
+      return glovErrorReport(true, msg, file, line, col);
+    };
   }
 
   safearea_ignore_bottom = params.safearea_ignore_bottom || false;
@@ -820,7 +922,13 @@ export function startup(params) {
   if (force_webgl1) {
     context_names.splice(0, 1);
   }
-  let context_opts = [{ antialias, powerPreference }, { powerPreference }, {}];
+  let context_opts = [
+    { antialias, powerPreference, alpha: false },
+    { powerPreference, alpha: false },
+    { antialias, alpha: false },
+    { alpha: false },
+    {},
+  ];
   let good = false;
   webgl2 = false;
   for (let i = 0; !good && i < context_names.length; i += 1) {
@@ -830,6 +938,10 @@ export function startup(params) {
         if (window.gl) {
           if (context_names[i] === 'webgl2') {
             webgl2 = true;
+          }
+          if (antialias && !context_opts[jj].antialias) {
+            antialias_unavailable = true;
+            antialias = false;
           }
           good = true;
           break;
@@ -850,30 +962,17 @@ export function startup(params) {
 
   assert(gl);
   canvas.focus();
-  width = canvas.width;
-  height = canvas.height;
-  game_width = params.game_width || 1280;
-  game_height = params.game_height || 960;
-  any_3d = params.any_3d || false;
+  setGameDims(params.game_width || 1280, params.game_height || 960);
   ZNEAR = params.znear || 0.7;
   ZFAR = params.zfar || 10000;
-  if (params.pixely === 'strict') {
-    render_width = game_width;
-    render_height = game_height;
-    if (params.viewport_postprocess) {
-      do_viewport_postprocess = true;
-    }
-  } else {
-    render_width = undefined;
-    render_height = undefined;
+  setPixelyStrict(params.pixely === 'strict');
+  if (params.viewport_postprocess) {
+    do_viewport_postprocess = true;
   }
   pixel_aspect = params.pixel_aspect || 1;
 
   gl.depthFunc(gl.LEQUAL);
   // gl.enable(gl.SCISSOR_TEST);
-  if (!any_3d) {
-    gl.disable(gl.CULL_FACE);
-  }
   gl.cullFace(gl.BACK);
   gl.clearColor(0, 0.1, 0.2, 1);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); // Allow RGB texture data with non-mult-4 widths
@@ -892,36 +991,39 @@ export function startup(params) {
     mat_inv_view: mat_inv_view,
     view: mat_view,
     projection: mat_projection,
-    projection_inverse,
+    // projection_inverse,
   });
   camera2d.startup();
   sprites.startup();
   input.startup(canvas, params);
-  if (any_3d) {
-    models.startup();
-  }
+  models.startup();
 
   /* eslint-disable global-require */
   glov_particles = require('./particles.js').create();
 
   if (is_pixely) {
     textures.defaultFilters(gl.NEAREST, gl.NEAREST);
+    settings.runTimeDefault('render_scale_mode', 1);
   } else {
     textures.defaultFilters(gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
   }
 
-  const font_info_04b03x2 = require('../img/font/04b03_8x2.json');
-  const font_info_04b03x1 = require('../img/font/04b03_8x1.json');
-  if (params.font) {
-    font = glov_font.create(params.font.info, params.font.texture);
-  } else if (params.pixely === 'strict') {
-    font = glov_font.create(font_info_04b03x1, 'font/04b03_8x1');
-  } else if (is_pixely) {
-    font = glov_font.create(font_info_04b03x2, 'font/04b03_8x2');
-  } else {
-    font = glov_font.create(font_info_palanquin32, 'font/palanquin32');
+  assert(params.font);
+  // If not, something like:
+  // const font_info_04b03x2 = require('../img/font/04b03_8x2.json');
+  // const font_info_04b03x1 = require('../img/font/04b03_8x1.json');
+  // const font_info_palanquin32 = require('../img/font/palanquin32.json');
+  // if (params.pixely === 'strict') {
+  //   font = glov_font.create(font_info_04b03x1, 'font/04b03_8x1');
+  // } else if (is_pixely) {
+  //   font = glov_font.create(font_info_04b03x2, 'font/04b03_8x2');
+  // } else {
+  //   font = glov_font.create(font_info_palanquin32, 'font/palanquin32');
+  // }
+  params.font = font = glov_font.create(params.font.info, params.font.texture);
+  if (params.title_font) {
+    params.title_font = glov_font.create(params.title_font.info, params.title_font.texture);
   }
-  params.font = font;
   glov_ui.startup(params);
 
   soundStartup(params.sound);

@@ -1,17 +1,33 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
+const engine = require('./engine.js');
+let metrics = [];
+export function addMetric(metric, first) {
+  if (metric.show_graph) {
+    metric.num_lines = metric.colors.length;
+    metric.history_size = metric.data.history.length / metric.num_lines;
+  }
+  metric.num_labels = Object.keys(metric.labels).length;
+  if (metric.interactable === undefined) {
+    metric.interactable = engine.DEBUG && (metric.num_labels > 1 && !metric.show_all || metric.show_graph);
+  }
+  if (first) {
+    metrics.splice(0, 0, metric);
+  } else {
+    metrics.push(metric);
+  }
+}
+
+
 const camera2d = require('./camera2d.js');
 const { cmd_parse } = require('./cmds.js');
-const engine = require('./engine.js');
 const glov_font = require('./font.js');
 const input = require('./input.js');
 const { max } = Math;
 const settings = require('./settings.js');
 const ui = require('./ui.js');
-const { vec4, v3copy } = require('./vmath.js');
-
-let metrics = [];
+const { vec4, v3copy } = require('glov/vmath.js');
 
 const METRIC_PAD = 2;
 
@@ -28,7 +44,7 @@ settings.register({
   },
   show_fps: {
     label: 'Show FPS',
-    default_value: 1,
+    default_value: engine.DEBUG ? 1 : 0,
     type: cmd_parse.TYPE_INT,
     range: [0,3],
   },
@@ -37,6 +53,12 @@ settings.register({
     default_value: 0,
     type: cmd_parse.TYPE_INT,
     range: [0,1],
+  },
+  fps_window: {
+    label: 'FPS Time Window (seconds)',
+    default_value: 1,
+    type: cmd_parse.TYPE_FLOAT,
+    range: [0.001, 120],
   },
 });
 
@@ -59,28 +81,16 @@ let fps_style = glov_font.style({
   color: 0xFFFFFFff,
 });
 
-export function addMetric(metric) {
-  if (metric.show_graph) {
-    metric.num_lines = metric.colors.length;
-    metric.history_size = metric.data.history.length / metric.num_lines;
-  }
-  metric.num_labels = Object.keys(metric.labels).length;
-  if (metric.interactable === undefined) {
-    metric.interactable = metric.num_labels > 1 || metric.show_graph;
-  }
-  metrics.push(metric);
-}
-
 function showMetric(y, metric) {
   let font = engine.font;
   let pad = METRIC_PAD;
-  let METRIC_VALUE_WIDTH = ui.font_height * 2.5;
+  let line_height = ui.font_height / settings.render_scale_all;
+  let METRIC_VALUE_WIDTH = line_height * (metric.width || 2.5);
   let x = camera2d.x1Real() - METRIC_VALUE_WIDTH - pad;
   let y0 = y;
   y += pad;
-  let line_height = ui.font_height;
   let max_label_w = 0;
-  let max_labels = settings[metric.show_stat];
+  let max_labels = metric.show_all ? Infinity : settings[metric.show_stat];
   let drew_any = false;
   let alpha = 1;
   for (let label in metric.labels) {

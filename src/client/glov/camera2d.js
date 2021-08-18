@@ -4,7 +4,7 @@
 
 const engine = require('./engine.js');
 
-const { round } = Math;
+const { max, round } = Math;
 
 const safearea_pad = new Float32Array(4); // left, right, top, bottom
 // 0: x0_real
@@ -13,7 +13,7 @@ const safearea_pad = new Float32Array(4); // left, right, top, bottom
 // 3: y1_real
 // 4: x_scale
 // 5: y_scale
-// 6: css_to_real
+// 6: dom_to_canvas_ratio
 // 7: inverse viewport x_scale
 // 8: inverse viewport y_scale
 // 9: x0
@@ -51,6 +51,19 @@ export function virtualToCanvas(dst, src) {
   dst[1] = (src[1] - data[1]) * data[5];
 }
 
+export function canvasToVirtual(dst, src) {
+  dst[0] = src[0] / data[4] + data[0];
+  dst[1] = src[1] / data[5] + data[1];
+}
+
+function safeScreenWidth() {
+  return max(1, screen_width - safearea_pad[0] - safearea_pad[1]);
+}
+
+function safeScreenHeight() {
+  return max(1, screen_height - safearea_pad[2] - safearea_pad[3]);
+}
+
 // Sets the 2D "camera" used to translate sprite positions to screen space.  Affects sprites queued
 //  after this call
 export function set(x0, y0, x1, y1, ignore_safe_area) {
@@ -64,8 +77,8 @@ export function set(x0, y0, x1, y1, ignore_safe_area) {
     data[10] = y0;
     data[11] = x1;
     data[12] = y1;
-    let wscale = (x1 - x0) / (screen_width - safearea_pad[0] - safearea_pad[1]);
-    let hscale = (y1 - y0) / (screen_height - safearea_pad[2] - safearea_pad[3]);
+    let wscale = (x1 - x0) / safeScreenWidth();
+    let hscale = (y1 - y0) / safeScreenHeight();
     data[0] = x0 - safearea_pad[0] * wscale;
     data[1] = y0 - safearea_pad[2] * hscale;
     data[2] = x1 + safearea_pad[1] * wscale;
@@ -104,8 +117,8 @@ export function domToCanvasRatio() {
 }
 
 export function screenAspect() {
-  return (screen_width - safearea_pad[0] - safearea_pad[1]) /
-    (screen_height - safearea_pad[2] - safearea_pad[3]);
+  return safeScreenWidth() /
+    safeScreenHeight();
 }
 
 // Drawing area 0,0-w,h
@@ -161,6 +174,10 @@ export function zoom(x, y, factor) {
     y - (y - data[1]) * inv_factor,
     x + (data[2] - x) * inv_factor,
     y + (data[3] - y) * inv_factor, true);
+}
+
+export function shift(dx, dy) {
+  set(data[0] + dx, data[1] + dy, data[2] + dx, data[3] + dy, true);
 }
 
 // returns [x0,y0,x1,y1] to use as parameters set() such that src_rect in the
@@ -288,6 +305,20 @@ export function domDeltaToVirtual(dst, src) {
   }
 }
 
+let input_clipping_virtual = new Float32Array(4);
+function updateVirtualInputClipping() {
+  domToVirtual(input_clipping_virtual, input_clipping);
+  //domDeltaToVirtual(input_clipping_virtual.slice(2), input_clipping.slice(2)) :
+  if (render_width) {
+    input_clipping_virtual[2] = input_clipping[2] * data[6] * data[7];
+    input_clipping_virtual[3] = input_clipping[3] * data[6] * data[8];
+  } else {
+    input_clipping_virtual[2] = input_clipping[2] * data[6] / data[4];
+    input_clipping_virtual[3] = input_clipping[3] * data[6] / data[5];
+  }
+}
+
+
 // To get to coordinates used by mouse events
 export function virtualToDom(dst, src) {
   if (render_width) {
@@ -322,8 +353,39 @@ export function virtualToDomPosParam(dst, src) {
   }
 }
 
+export function clipTestRect(rect) {
+  if (!input_clipping) {
+    return true;
+  }
+  updateVirtualInputClipping();
+  let icv = input_clipping_virtual;
+  if (rect.x > icv[0] + icv[2] ||
+    rect.x + rect.w < icv[0] ||
+    rect.y > icv[1] + icv[3] ||
+    rect.y + rect.h < icv[1]
+  ) {
+    // fully clipped
+    return false;
+  }
+  if (rect.x < icv[0]) {
+    rect.w -= icv[0] - rect.x;
+    rect.x = icv[0];
+  }
+  if (rect.y < icv[1]) {
+    rect.h -= icv[1] - rect.y;
+    rect.y = icv[1];
+  }
+  if (rect.x + rect.w > icv[0] + icv[2]) {
+    rect.w = icv[0] + icv[2] - rect.x;
+  }
+  if (rect.y + rect.h > icv[1] + icv[3]) {
+    rect.h = icv[1] + icv[3] - rect.y;
+  }
+  return true;
+}
+
 export function tickCamera2D() {
-  data[6] = window.devicePixelRatio || 1; /* css_to_real */
+  data[6] = engine.dom_to_canvas_ratio; /* dom_to_canvas_ratio */
   screen_width = engine.width;
   screen_height = engine.height;
   let viewport = [0, 0, screen_width, screen_height];
@@ -333,8 +395,8 @@ export function tickCamera2D() {
     // Find an offset so this rendered viewport is centered while preserving aspect ratio, just like setAspectFixed
     let pa = engine.pixel_aspect;
     let inv_aspect = render_height / pa / render_width;
-    let eff_screen_width = (screen_width - safearea_pad[0] - safearea_pad[1]);
-    let eff_screen_height = (screen_height - safearea_pad[2] - safearea_pad[3]);
+    let eff_screen_width = safeScreenWidth();
+    let eff_screen_height = safeScreenHeight();
     let inv_desired_aspect = eff_screen_height / eff_screen_width;
     if (inv_aspect > inv_desired_aspect) {
       let margin = (render_height / inv_desired_aspect - render_width * pa) / 2 *
@@ -382,6 +444,8 @@ export function tickCamera2D() {
 }
 
 export function startup() {
+  screen_width = engine.width;
+  screen_height = engine.height;
   set(0, 0, engine.width, engine.height);
   tickCamera2D();
 }

@@ -1,6 +1,9 @@
 // Portions Copyright 2019 Jimb Esser (https://github.com/Jimbly/)
 // Released under MIT License: https://opensource.org/licenses/MIT
 
+export let wsstats = { msgs: 0, bytes: 0 };
+export let wsstats_out = { msgs: 0, bytes: 0 };
+
 const ack = require('./ack.js');
 const assert = require('assert');
 const { ackHandleMessage, ackReadHeader, ackWrapPakStart, ackWrapPakPayload, ackWrapPakFinish } = ack;
@@ -29,6 +32,8 @@ export function wsPakSendDest(client, pak) {
   if (buf_len !== buf.length) {
     buf = new Uint8Array(buf.buffer, buf.byteOffset, buf_len);
   }
+  wsstats_out.msgs++;
+  wsstats_out.bytes += buf.length;
   if (client.ws_server) {
     client.socket.send(buf, function () {
       pak.pool();
@@ -66,10 +71,12 @@ function wsPakSendFinish(pak, err, resp_func) {
       }
       msg = `channel_msg:${channel_id}:${submsg}`;
     }
-    (client.log ? client : console).log(`Attempting to send msg=${msg} on a disconnected link, ignoring`);
-    if (!client.log && client.onError && msg && typeof msg !== 'number') {
-      // On the client, if we try to send a new packet while disconnected, this is an application error
-      client.onError(`Attempting to send msg=${msg} on a disconnected link`);
+    if (typeof msg !== 'number') {
+      (client.log ? client : console).log(`Attempting to send msg=${msg} on a disconnected link, ignoring`);
+      if (!client.log && client.onError && msg) {
+        // On the client, if we try to send a new packet while disconnected, this is an application error
+        client.onError(`Attempting to send msg=${msg} on a disconnected link`);
+      }
     }
 
     if (ack_resp_pkt_id) {
@@ -127,16 +134,19 @@ export function sendMessage(msg, data, resp_func) {
   sendMessageInternal(this, msg, null, data, resp_func); // eslint-disable-line no-invalid-this
 }
 
-export function wsHandleMessage(client, buf) {
+export function wsHandleMessage(client, buf, filter) {
+  ++wsstats.msgs;
   let now = Date.now();
   let source = client.id ? `client ${client.id}` : 'server';
   if (!(buf instanceof Uint8Array)) {
     (client.log ? client : console).log(`Received incorrect WebSocket data type from ${source} (${typeof buf})`);
     return client.onError('Invalid data received');
   }
+  wsstats.bytes += buf.length;
   let pak = packetFromBuffer(buf, buf.length, false);
   pak.readFlags();
   client.last_receive_time = now;
+  client.idle_counter = 0;
 
   return ackHandleMessage(client, source, pak, function sendFunc(msg, err, data, resp_func) {
     if (resp_func && !resp_func.expecting_response) {
@@ -156,5 +166,5 @@ export function wsHandleMessage(client, buf) {
       return resp_func(error_msg);
     }
     return handler(client, data, resp_func);
-  });
+  }, filter);
 }

@@ -8,20 +8,41 @@ const {
   chunkedReceiverInit,
   chunkedReceiverOnChunk,
   chunkedReceiverStart,
-} = require('../../common/chunked_send.js');
+} = require('glov/chunked_send.js');
 const client_worker = require('./client_worker.js');
 const createHmac = require('crypto').createHmac;
-const { channelServerPak, channelServerSend } = require('./channel_server.js');
+const { channelServerPak, channelServerSend, quietMessage } = require('./channel_server.js');
 const { regex_valid_username } = require('./default_workers.js');
+const { logSubscribeClient, logUnsubscribeClient } = require('./log.js');
 const fs = require('fs');
-const { isPacket } = require('../../common/packet.js');
-const { logdata } = require('../../common/util.js');
-const { isProfane, profanityCommonStartup } = require('../../common/words/profanity_common.js');
+const { isPacket } = require('glov/packet.js');
+const { logdata } = require('glov/util.js');
+const { isProfane, profanityCommonStartup } = require('glov/words/profanity_common.js');
 const random_names = require('./random_names.js');
 const { serverConfig } = require('./server_config.js');
 
 // combined size of all chunked sends at any given time
 const MAX_CLIENT_UPLOAD_SIZE = 1*1024*1024;
+
+// Note: this object is both filtering wsclient -> wsserver messages and client->channel messages
+let ALLOWED_DURING_RESTART = Object.create(null);
+ALLOWED_DURING_RESTART.login = true; // filtered at lower level
+ALLOWED_DURING_RESTART.logout = true; // always allow
+ALLOWED_DURING_RESTART.channel_msg = true; // filtered at lower level
+ALLOWED_DURING_RESTART.chat = true;
+
+let channel_server;
+
+
+function restartFilter(client, msg, data) {
+  if (client && client.client_channel && client.client_channel.ids && client.client_channel.ids.sysadmin) {
+    return true;
+  }
+  if (ALLOWED_DURING_RESTART[msg]) {
+    return true;
+  }
+  return false;
+}
 
 function onUnSubscribe(client, channel_id) {
   client.client_channel.unsubscribeOther(channel_id);
@@ -37,12 +58,17 @@ function uploadCleanup(client) {
 function onClientDisconnect(client) {
   uploadCleanup(client);
   client.client_channel.unsubscribeAll();
-  client.client_channel.shutdown();
+  client.client_channel.shutdownImmediate();
 }
 
 function onSubscribe(client, channel_id, resp_func) {
-  console.debug(`client_id:${client.id}->${channel_id}: subscribe`);
-  client.client_channel.subscribeOther(channel_id, resp_func);
+  client.client_channel.logDest(channel_id, 'debug', 'subscribe');
+  client.client_channel.subscribeOther(channel_id, ['*'], resp_func);
+}
+
+let set_channel_data_async_reply = false;
+export function setChannelDataAsyncReply(do_async) {
+  set_channel_data_async_reply = do_async;
 }
 
 function onSetChannelData(client, pak, resp_func) {
@@ -53,13 +79,13 @@ function onSetChannelData(client, pak, resp_func) {
   let key = pak.readAnsiString();
   let keyparts = key.split('.');
   if (keyparts[0] !== 'public' && keyparts[0] !== 'private') {
-    console.error(` - failed, invalid scope: ${keyparts[0]}`);
+    client.client_channel.logCtx('error', ` - failed, invalid scope: ${keyparts[0]}`);
     resp_func('failed: invalid scope');
     pak.pool();
     return;
   }
   if (!keyparts[1]) {
-    console.error(' - failed, missing member name');
+    client.client_channel.logCtx('error', ' - failed, missing member name');
     resp_func('failed: missing member name');
     pak.pool();
     return;
@@ -80,26 +106,25 @@ function onSetChannelData(client, pak, resp_func) {
   outpak.writeBool(q);
   outpak.writeAnsiString(key);
   outpak.appendRemaining(pak);
-  outpak.send();
   client_channel.ids = client_channel.ids_base;
-  resp_func();
+  if (set_channel_data_async_reply) {
+    outpak.send(resp_func);
+  } else {
+    outpak.send();
+    resp_func();
+  }
 }
 
 function applyCustomIds(ids, user_data_public) {
   // FRVR - maybe generalize this
   let perm = user_data_public.permissions;
-  delete ids.admin;
+  delete ids.sysadmin;
+  delete ids.elevated;
   if (perm) {
-    if (perm.admin) {
-      ids.admin = 1;
+    if (perm.sysadmin) {
+      ids.sysadmin = 1;
     }
   }
-}
-
-function quietMessage(msg, payload) {
-  // FRVR - maybe generalize this?
-  return msg === 'set_user' && payload && payload.key === 'pos' ||
-    msg === 'vd_get' || msg === 'claim';
 }
 
 const nop_pool = {
@@ -109,7 +134,7 @@ const nop_pool = {
 };
 
 function onChannelMsg(client, data, resp_func) {
-  // Arbitrary messages, or messages to everyone subscribed to the channel, e.g. chat
+  // Arbitrary messages
   let channel_id;
   let msg;
   let payload;
@@ -136,12 +161,17 @@ function onChannelMsg(client, data, resp_func) {
     payload = data.data;
     log = logdata(payload);
   }
+  if (channel_server.restarting) {
+    if (!restartFilter(client, msg, data)) {
+      return;
+    }
+  }
   if (quietMessage(msg, payload)) {
     if (!is_packet && typeof payload === 'object') {
       payload.q = 1; // do not print later, either
     }
   } else {
-    console.debug(`client_id:${client.id}->${channel_id}: channel_msg ${msg} ${log}`);
+    client.client_channel.logDest(channel_id, 'debug', `channel_msg ${msg} ${log}`);
   }
   if (!channel_id) {
     pool.pool();
@@ -158,17 +188,19 @@ function onChannelMsg(client, data, resp_func) {
   }
   let old_resp_func = resp_func;
   resp_func = function (err, resp_data) {
-    if (err) { // Was previously just on cmd_parse packets: && !(net_data.data && net_data.data.silent_error)) {
+    if (err && err !== 'ERR_FAILALL_DISCONNECT') { // Was previously not logging on cmd_parse packets to
       client.log(`Error "${err}" sent from ${channel_id} to client in response to ${
-        msg} ${logdata(payload)}`);
+        msg} ${is_packet ? '(pak)' : logdata(payload)}`);
     }
     if (old_resp_func) {
       old_resp_func(err, resp_data);
+    } else if (err && err !== 'ERR_FAILALL_DISCONNECT') {
+      client.send('error', err);
     }
   };
   resp_func.expecting_response = Boolean(old_resp_func);
   client_channel.ids = client_channel.ids_direct;
-  channelServerSend(client_channel, channel_id, msg, null, payload, resp_func);
+  channelServerSend(client_channel, channel_id, msg, null, payload, resp_func, true); // quiet since we already logged
   client_channel.ids = client_channel.ids_base;
   pool.pool();
 }
@@ -182,16 +214,25 @@ const invalid_names = {
   tostring: 1,
   valueof: 1,
   admin: 1,
+  sysadmin: 1,
+  sysop: 1,
   gm: 1,
   mod: 1,
   moderator: 1,
   default: 1,
+  all: 1,
+  everyone: 1,
   anonymous: 1,
   public: 1,
   clear: 1,
   wipe: 1,
   reset: 1,
   password: 1,
+  server: 1,
+  system: 1,
+  internal: 1,
+  error: 1,
+  info: 1,
   user: 1,
 };
 const regex_admin_username = /^(admin|mod_|gm_|moderator)/; // Might exist in the system, do not allow to be created
@@ -227,17 +268,18 @@ function handleLoginResponse(message, client, user_id, resp_func, err, resp_data
 
   if (client_channel.ids.user_id) {
     // Logged in while processing the response?
-    console.log(`client_id:${client.id} ${message} failed: Already logged in`);
+    client.client_channel.logCtx('info', `${message} failed: Already logged in`);
     return resp_func('Already logged in');
   }
 
   if (err) {
-    console.log(`client_id:${client.id} ${message} failed: ${err}`);
+    client.client_channel.logCtx('info', `${message} failed: ${err}`);
   } else {
-    console.log(`client_id:${client.id} ${message} success: logged in as ${user_id}`);
     client_channel.ids_base.user_id = user_id;
     client_channel.ids_base.display_name = resp_data.display_name;
+    client_channel.log_user_id = user_id;
     applyCustomIds(client_channel.ids, resp_data);
+    client.client_channel.logCtx('info', `${message} success: logged in as ${user_id}`, { ip: client.addr });
 
     // Tell channels we have a new user id/display name
     for (let channel_id in client_channel.subscribe_counts) {
@@ -251,10 +293,10 @@ function handleLoginResponse(message, client, user_id, resp_func, err, resp_data
 }
 
 function onLogin(client, data, resp_func) {
-  console.log(`client_id:${client.id}->server login ${logdata(data)}`);
+  client.client_channel.logCtx('info', `login ${logdata(data)}`, { ip: client.addr });
   let user_id = data.user_id;
   if (!validUsername(user_id, true)) {
-    console.log(`client_id:${client.id} login failed: Invalid username`);
+    client.client_channel.logCtx('info', 'login failed: Invalid username');
     return resp_func('Invalid username');
   }
   user_id = user_id.toLowerCase();
@@ -267,12 +309,13 @@ function onLogin(client, data, resp_func) {
     password: data.password,
     salt: client.secret,
     ip: client.addr,
+    ua: client.user_agent,
   }, handleLoginResponse.bind(null, 'login', client, user_id, resp_func));
 }
 
 let facebook_access_token;
 function onLoginFacebook(client, data, resp_func) {
-  console.log(`client_id:${client.id}->server login_facebook ${logdata(data)}`);
+  client.client_channel.logCtx('info', `login_facebook ${logdata(data)}`);
   assert(facebook_access_token, 'Missing facebook.access_token in config/server.json');
 
   const signatureComponent = data.signature.split('.');
@@ -282,7 +325,7 @@ function onLoginFacebook(client, data, resp_func) {
   if (generated_signature === signature) {
     const payload = JSON.parse(Buffer.from(signatureComponent[1], 'base64').toString('utf8'));
     let user_id = `fb$${payload.player_id}`;
-    console.log(`client_id:${client.id} login_facebook ${user_id} success ${logdata(payload)}`);
+    client.client_channel.logCtx('info', `login_facebook ${user_id} success ${logdata(payload)}`);
 
     let client_channel = client.client_channel;
     assert(client_channel);
@@ -290,19 +333,20 @@ function onLoginFacebook(client, data, resp_func) {
     return channelServerSend(client_channel, `user.${user_id}`, 'login_facebook', null, {
       display_name: data.display_name,
       ip: client.addr,
+      ua: client.user_agent,
     }, handleLoginResponse.bind(null, 'login_facebook', client, user_id, resp_func));
 
   } else {
-    console.log(`client_id:${client.id} login_facebook auth failed`, generated_signature, signature);
+    client.client_channel.logCtx('info', 'login_facebook auth failed', generated_signature, signature);
     return resp_func('Auth Failed');
   }
 }
 
 function onUserCreate(client, data, resp_func) {
-  console.log(`client_id:${client.id}->server user_create ${logdata(data)}`);
+  client.client_channel.logCtx('info', `user_create ${logdata(data)}`);
   let user_id = data.user_id;
   if (!validUsername(user_id)) {
-    console.log(`client_id:${client.id} user_create failed: Invalid username`);
+    client.client_channel.logCtx('info', 'user_create failed: Invalid username');
     return resp_func('Invalid username');
   }
   user_id = user_id.toLowerCase();
@@ -311,7 +355,7 @@ function onUserCreate(client, data, resp_func) {
   assert(client_channel);
 
   if (client_channel.ids.user_id) {
-    console.log(`client_id:${client.id} user_create failed: Already logged in`);
+    client.client_channel.logCtx('info', 'user_create failed: Already logged in');
     return resp_func('Already logged in');
   }
 
@@ -320,6 +364,7 @@ function onUserCreate(client, data, resp_func) {
     password: data.password,
     email: data.email,
     ip: client.addr,
+    ua: client.user_agent,
   }, handleLoginResponse.bind(null, 'user_create', client, user_id, resp_func));
 }
 
@@ -327,7 +372,7 @@ function onLogOut(client, data, resp_func) {
   let client_channel = client.client_channel;
   assert(client_channel);
   let { user_id } = client_channel.ids;
-  console.log(`client_id:${client.id}->server logout ${user_id}`);
+  client.client_channel.logCtx('info', `logout ${user_id}`);
   if (!user_id) {
     return resp_func('ERR_NOT_LOGGED_IN');
   }
@@ -335,6 +380,8 @@ function onLogOut(client, data, resp_func) {
   onUnSubscribe(client, `user.${user_id}`);
   delete client_channel.ids_base.user_id;
   delete client_channel.ids_base.display_name;
+  delete client_channel.ids_base.sysadmin;
+  client_channel.log_user_id = null;
 
   // Tell channels we have a new user id/display name
   for (let channel_id in client_channel.subscribe_counts) {
@@ -352,7 +399,22 @@ function onLog(client, data, resp_func) {
   let client_channel = client.client_channel;
   data.user_id = client_channel.ids.user_id;
   data.display_name = client_channel.ids.display_name;
-  console.log(`client_id:${client.id} server_log`, data);
+  client.client_channel.logCtx('info', 'server_log', data);
+  resp_func();
+}
+
+function onLogSubscribe(client, data, resp_func) {
+  if (!client.glov_is_dev) {
+    return void resp_func('ERR_ACCESS_DENIED');
+  }
+  logSubscribeClient(client);
+  resp_func();
+}
+function onLogUnsubscribe(client, data, resp_func) {
+  if (!client.glov_is_dev) {
+    return void resp_func('ERR_ACCESS_DENIED');
+  }
+  logUnsubscribeClient(client);
   resp_func();
 }
 
@@ -371,9 +433,22 @@ function uploadOnFinish(client, pak, resp_func) {
   chunkedReceiverFinish(client.chunked, pak, resp_func);
 }
 
-export function init(channel_server) {
-  profanityCommonStartup(fs.readFileSync(`${__dirname}/../../common/words/filter.gkg`, 'utf8'));
+function onGetStats(client, data, resp_func) {
+  resp_func(null, { ccu: channel_server.master_stats.num_channels.client || 1 });
+}
 
+function onCmdParseAuto(client, pak, resp_func) {
+  let cmd = pak.readString();
+  let { client_channel } = client;
+  client_channel.cmdParseAuto({ cmd }, (err, resp) => {
+    resp_func(err, resp ? resp.resp : null);
+  });
+}
+
+export function init(channel_server_in) {
+  profanityCommonStartup(fs.readFileSync(`${__dirname}/../../common/glov/words/filter.gkg`, 'utf8'));
+
+  channel_server = channel_server_in;
   let ws_server = channel_server.ws_server;
   ws_server.on('client', (client) => {
     let client_id = channel_server.clientIdFromWSClient(client);
@@ -392,12 +467,19 @@ export function init(channel_server) {
   ws_server.onMsg('logout', onLogOut);
   ws_server.onMsg('random_name', onRandomName);
   ws_server.onMsg('log', onLog);
+  ws_server.onMsg('log_subscribe', onLogSubscribe);
+  ws_server.onMsg('log_unsubscribe', onLogUnsubscribe);
+  ws_server.onMsg('get_stats', onGetStats);
+  ws_server.onMsg('cmd_parse_auto', onCmdParseAuto);
 
   ws_server.onMsg('upload_start', uploadOnStart);
   ws_server.onMsg('upload_chunk', uploadOnChunk);
   ws_server.onMsg('upload_finish', uploadOnFinish);
 
-  facebook_access_token = serverConfig().facebook && serverConfig().facebook.access_token;
+  ws_server.setRestartFilter(restartFilter);
+
+  facebook_access_token = process.env.FACEBOOK_ACCESS_TOKEN ||
+    serverConfig().facebook && serverConfig().facebook.access_token;
 
   client_worker.init(channel_server);
 }

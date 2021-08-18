@@ -14,10 +14,10 @@ const fs = require('fs');
 const log = require('./log.js');
 const metrics = require('./metrics.js');
 const path = require('path');
-const packet = require('../../common/packet.js');
+const packet = require('glov/packet.js');
 const { serverConfig } = require('./server_config.js');
 const glov_wsserver = require('./wsserver.js');
-const glov_wscommon = require('../../common/wscommon.js');
+const glov_wscommon = require('glov/wscommon.js');
 
 const STATUS_TIME = 5000;
 const FILE_CHANGE_POLL = 16;
@@ -62,7 +62,10 @@ function updateVersion(base_name, is_startup) {
       ws_server.setAppVer(obj.ver);
       if (!is_startup) {
         // Do a broadcast message so people get a few seconds of warning
-        ws_server.broadcast('admin_msg', 'New client version deployed, reloading momentarily...');
+        ws_server.broadcast('chat_broadcast', {
+          src: 'system',
+          msg: 'New client version deployed, reloading momentarily...'
+        });
         if (argv.dev) {
           // immediate
           ws_server.broadcast('app_ver', last_version.app);
@@ -126,7 +129,7 @@ export function startup(params) {
     glov_wscommon.PROTOCOL_VERSION = params.pver;
   }
 
-  let { data_stores, exchange, metrics_impl } = params;
+  let { data_stores, exchange, metrics_impl, on_report_load } = params;
   if (!data_stores) {
     data_stores = {};
   }
@@ -137,8 +140,21 @@ export function startup(params) {
     data_stores.meta = data_store.create('data_store');
   } else if (server_config.do_mirror) {
     if (data_stores.meta) {
-      console.log('[DATASTORE] Mirroring meta store (local authoritative)');
-      data_stores.meta = data_store_mirror.create(data_store.create('data_store'), data_stores.meta);
+      if (server_config.local_authoritative === false) {
+        console.log('[DATASTORE] Mirroring meta store (cloud authoritative)');
+        data_stores.meta = data_store_mirror.create({
+          read_check: true,
+          readwrite: data_stores.meta,
+          write: data_store.create('data_store'),
+        });
+      } else {
+        console.log('[DATASTORE] Mirroring meta store (local authoritative)');
+        data_stores.meta = data_store_mirror.create({
+          read_check: true,
+          readwrite: data_store.create('data_store'),
+          write: data_stores.meta,
+        });
+      }
     }
   }
   if (!data_stores.bulk) {
@@ -148,8 +164,21 @@ export function startup(params) {
     }
   } else if (server_config.do_mirror) {
     if (data_stores.bulk) {
-      console.log('[DATASTORE] Mirroring bulk store (local authoritative)');
-      data_stores.bulk = data_store_mirror.create(data_store.create('data_store/bulk'), data_stores.bulk);
+      if (server_config.local_authoritative === false) {
+        console.log('[DATASTORE] Mirroring bulk store (cloud authoritative)');
+        data_stores.bulk = data_store_mirror.create({
+          read_check: true,
+          readwrite: data_stores.bulk,
+          write: data_store.create('data_store/bulk'),
+        });
+      } else {
+        console.log('[DATASTORE] Mirroring bulk store (local authoritative)');
+        data_stores.bulk = data_store_mirror.create({
+          read_check: true,
+          readwrite: data_store.create('data_store/bulk'),
+          write: data_stores.bulk,
+        });
+      }
     }
   }
   if (server_config.do_shield) {
@@ -175,12 +204,15 @@ export function startup(params) {
     console.log('PacketDebug: ON');
     packet.default_flags = packet.PACKET_DEBUG;
   }
+  if (server_config.log && server_config.log.load_log) {
+    channel_server.load_log = true;
+  }
 
   ws_server = glov_wsserver.create(params.server, params.server_https);
   ws_server.on('error', function (error) {
     console.error('Unhandled WSServer error:', error);
     let text = String(error);
-    if (text.indexOf('Invalid WebSocket frame: RSV1 must be clear') !== -1) {
+    if (text.indexOf('Invalid WebSocket frame:') !== -1) {
       // Log, but don't broadcast or write crash dump
       console.error('ERROR (no dump)', new Date().toISOString(), error);
     } else {
@@ -192,9 +224,14 @@ export function startup(params) {
     exchange,
     data_stores,
     ws_server,
+    on_report_load,
+    is_master: argv.master,
   });
 
+  process.on('SIGTERM', channel_server.forceShutdown.bind(channel_server));
   process.on('uncaughtException', channel_server.handleUncaughtError.bind(channel_server));
+  ws_server.on('uncaught_exception', channel_server.handleUncaughtError.bind(channel_server));
+
   setTimeout(displayStatus, STATUS_TIME);
 
   let deferred_file_changes = {};
@@ -228,7 +265,17 @@ export function startup(params) {
   updateVersion('app', true);
 }
 
-export function shutdown(...message) {
-  console.error(...message);
-  process.exit(1);
+export function panic(...message) {
+  if (message && message.length === 1 && message[0] instanceof Error) {
+    console.error(message[0]);
+  } else {
+    console.error(...message); // Log all parameters
+    console.error(new Error(message)); // So Stackdriver error reporting catches it
+  }
+  console.error('Process exiting due to panic');
+  process.stderr.write(String(message), () => {
+    console.error('Process exiting due to panic (2)'); // May not be seen due to buffering, but useful if it is seen
+    process.exit(1);
+  });
+  throw new Error('panic'); // ensure calling code does not continue
 }

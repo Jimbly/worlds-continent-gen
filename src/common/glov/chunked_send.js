@@ -2,7 +2,7 @@
 // Released under MIT License: https://opensource.org/licenses/MIT
 
 const assert = require('assert');
-const { asyncParallelLimit, asyncSeries } = require('./async.js');
+const { asyncParallelLimit, asyncSeries } = require('glov-async');
 const crc32 = require('./crc32.js');
 const { ceil, min } = Math;
 const { packetBufPoolAlloc, packetBufPoolFree } = require('./packet.js');
@@ -131,6 +131,9 @@ export function chunkedReceiverOnChunk(state, pak, resp_func) {
   console.debug(log);
   file_data.total += buf.length;
   file_data.dv.u8.set(buf, offs);
+  if (state.on_progress) {
+    state.on_progress(file_data.total, file_data.length, file_data.mime_type, id);
+  }
   resp_func();
 }
 
@@ -174,7 +177,7 @@ export function chunkedSend(opts, cb) {
   let id;
   asyncSeries([
     function getID(next) {
-      let pak = client.wsPak('upload_start');
+      let pak = client.pak('upload_start');
       pak.writeInt(length);
       pak.writeU32(crc);
       pak.writeAnsiString(mime_type);
@@ -188,7 +191,7 @@ export function chunkedSend(opts, cb) {
 
       function sendChunk(idx, next) {
         assert(idx < num_chunks);
-        let pak = client.wsPak('upload_chunk');
+        let pak = client.pak('upload_chunk');
         pak.writeInt(id);
         let start = idx * CHUNK_SIZE;
         pak.writeInt(start);
@@ -203,7 +206,7 @@ export function chunkedSend(opts, cb) {
       asyncParallelLimit(tasks, max_in_flight, next);
     },
     function finish(next) {
-      let pak = client.wsPak('upload_finish');
+      let pak = client.pak('upload_finish');
       pak.writeInt(id);
       pak.send(next);
     },
